@@ -1,0 +1,17 @@
+#DLA
+ultralytics
+
+#OCR
+pytesseract
+
+#TTS
+gtts
+pydub
+pyrubberband
+resampy
+
+#Indic Translation
+sacrebleu
+sacremoses
+indic-nlp-library
+git+https://github.com/VarunGumma/IndicTransTokenizer.git

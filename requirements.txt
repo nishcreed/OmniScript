@@ -15,3 +15,11 @@ sacrebleu
 sacremoses
 indic-nlp-library
 git+https://github.com/VarunGumma/IndicTransTokenizer.git
+
+
+#API
+fastapi
+uvicorn
+
+#UI
+gradio

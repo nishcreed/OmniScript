@@ -4,11 +4,18 @@ ultralytics
 #OCR
 pytesseract
 
+#Caption
+torch
+transformers
+accelerate
+
 #TTS
 gtts
 pydub
 pyrubberband
 resampy
+numpy
+soundfile
 
 #Indic Translation
 sacrebleu

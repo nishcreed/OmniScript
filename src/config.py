@@ -7,7 +7,7 @@ class Settings:
     layout_model_path: Path = Path(
         os.getenv(
             "OMNISCRIPT_LAYOUT_MODEL",
-            "models/yolov8x-doclaynet.pt"
+            "models/yolov8x-doclaynet-epoch64-imgsz640-initiallr1e-4-finallr1e-5.pt"
         )
     )
 

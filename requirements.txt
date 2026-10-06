@@ -27,6 +27,7 @@ git+https://github.com/VarunGumma/IndicTransTokenizer.git
 #API
 fastapi
 uvicorn
+python-multipart
 
 #UI
 gradio

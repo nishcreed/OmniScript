@@ -73,118 +73,33 @@ def load_itm_model() -> tuple[Any, Any]:
     return model, processor
 
 
-#Translation
-def associate_images(
-    page: PageResult,
-    texts: list[str],
-    captions: dict[int, str],
-) -> list[str]:
-    """
-    Place each picture caption next to its most relevant text.
-    """
+# Translation
+@lru_cache(maxsize=1)
+def load_translation_model() -> tuple[Any, Any]:
+    """Load the English-to-Indic model and tokenizer once."""
 
-    model, processor = load_itm_model()
+    import torch
+    from transformers import AutoModelForSeq2SeqLM
+    from IndicTransTokenizer.IndicTransTokenizer import IndicTransTokenizer
 
-    image = Image.open(
-        page.image_path
-    ).convert("RGB")
+    device = settings.device
 
-    image_height = image.height
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    output_texts = list(texts)
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA was requested, but PyTorch cannot access a GPU."
+        )
 
-    picture_regions = page.regions.get(
-        "Picture",
-        [],
+    tokenizer = IndicTransTokenizer(direction="en-indic")
+
+    model = AutoModelForSeq2SeqLM.from_pretrained(
+        "ai4bharat/indictrans2-en-indic-dist-200M",
+        trust_remote_code=True,
     )
 
-    for index, region in enumerate(
-        picture_regions,
-        start=1,
-    ):
-        caption = captions[index]
+    model = model.to(device)
+    model.eval()
 
-        y1 = region.box[1]
-        y2 = region.box[3]
-
-        if y1 < 50:
-            output_texts.insert(
-                0,
-                caption,
-            )
-            continue
-
-        if y2 > image_height - 50:
-            output_texts.append(
-                caption,
-            )
-            continue
-
-        candidates = [
-            text
-            for text in output_texts
-            if not text.startswith(
-                "A picture of "
-            )
-        ]
-
-        if not candidates:
-            output_texts.append(
-                caption,
-            )
-            continue
-
-        cropped_image = image.crop(
-            tuple(region.box)
-        )
-
-        scores: list[float] = []
-
-        for candidate in candidates:
-            inputs = processor(
-                images=cropped_image,
-                text=candidate,
-                return_tensors="pt",
-            )
-
-            inputs = {
-                key: value.to(model.device)
-                for key, value in inputs.items()
-            }
-
-            with torch.inference_mode():
-                result = model(
-                    **inputs,
-                    use_image_text_matching_head=True,
-                )
-
-            probabilities = torch.softmax(
-                result.logits_per_image,
-                dim=1,
-            )
-
-            matching_probability = (
-                probabilities[0][1].item()
-            )
-
-            scores.append(
-                matching_probability
-            )
-
-        best_index = scores.index(
-            max(scores)
-        )
-
-        best_text = candidates[best_index]
-
-        insert_index = output_texts.index(
-            best_text
-        )
-
-        output_texts.insert(
-            insert_index + 1,
-            caption,
-        )
-
-    return output_texts
-
+    return model, tokenizer

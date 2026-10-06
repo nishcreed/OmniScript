@@ -234,105 +234,152 @@ def clean_text(text: str) -> str:
 
 
 def extract_text(page: PageResult) -> list[str]:
-    """
-    Extract text from all Text regions on one page.
-    """
+    """Read textual regions, with headers first and footers last."""
 
     import pytesseract
 
-    pytesseract.pytesseract.tesseract_cmd = (
-        settings.tesseract_command
-    )
+    pytesseract.pytesseract.tesseract_cmd = settings.tesseract_command
 
-    image = Image.open(page.image_path)
-
-    text_regions = page.regions.get(
+    content_labels = {
         "Text",
-        [],
+        "Title",
+        "Section-header",
+        "List-item",
+        "Footnote",
+        "Formula",
+    }
+
+    headers = sort_regions(page.regions.get("Page-header", []))
+
+    content = sort_regions(
+        region
+        for label, regions in page.regions.items()
+        if label in content_labels
+        for region in regions
     )
 
-    ordered_regions = sort_regions(
-        text_regions
-    )
+    footers = sort_regions(page.regions.get("Page-footer", []))
 
     extracted_text: list[str] = []
 
-    for region in ordered_regions:
-        cropped_image = image.crop(
-            tuple(region.box)
-        )
+    with Image.open(page.image_path) as source:
+        image = source.convert("RGB")
 
-        processed_image = preprocess_image(
-            cropped_image
-        )
+        for region in headers + content + footers:
+            # Keep crop coordinates within the image.
+            x1, y1, x2, y2 = region.box
+            box = (
+                max(0, min(image.width, x1)),
+                max(0, min(image.height, y1)),
+                max(0, min(image.width, x2)),
+                max(0, min(image.height, y2)),
+            )
 
-        raw_text = pytesseract.image_to_string(
-            processed_image
-        )
+            if box[2] <= box[0] or box[3] <= box[1]:
+                continue
 
-        text = clean_text(
-            raw_text
-        )
+            cropped_image = image.crop(box)
+            processed_image = preprocess_image(cropped_image)
 
-        if text:
+            text = clean_text(
+                pytesseract.image_to_string(processed_image)
+            )
+
+            if not text:
+                continue
+
+            # Preserve the notebook's narration markers.
+            if region.label != "Text":
+                text = f"_*{region.label}: {text}*_."
+
             extracted_text.append(text)
 
     page.text = extracted_text
-
     return extracted_text
 
 
 #Caption Generation
 def caption_images(page: PageResult) -> dict[int, str]:
-    """
-    Generate captions for all Picture regions on a page.
-    """
+    """Read nearby printed captions, or generate picture descriptions."""
 
-    model, processor = load_captioning_model()
+    import pytesseract
 
-    image = Image.open(
-        page.image_path
-    ).convert("RGB")
+    pytesseract.pytesseract.tesseract_cmd = settings.tesseract_command
 
     captions: dict[int, str] = {}
+    printed_captions = page.regions.get("Caption", [])
 
-    picture_regions = page.regions.get(
-        "Picture",
-        [],
-    )
+    with Image.open(page.image_path) as source:
+        image = source.convert("RGB")
 
-    for index, region in enumerate(
-        picture_regions,
-        start=1,
-    ):
-        cropped_image = image.crop(
-            tuple(region.box)
-        )
+        # Preserve this order: associate_images() uses the same indices.
+        for index, picture in enumerate(
+            page.regions.get("Picture", []),
+            start=1,
+        ):
+            px1, py1, px2, py2 = picture.box
 
-        inputs = processor(
-            images=cropped_image,
-            text="",
-            return_tensors="pt",
-        )
+            # Look below the picture, with horizontal overlap.
+            nearby = [
+                region
+                for region in printed_captions
+                if abs(region.box[1] - py2) <= 30
+                and min(px2, region.box[2]) > max(px1, region.box[0])
+            ]
+            nearby.sort(key=lambda region: abs(region.box[1] - py2))
 
-        inputs = {
-            key: value.to(model.device)
-            for key, value in inputs.items()
-        }
+            printed_text = ""
 
-        with torch.inference_mode():
-            generated_ids = model.generate(
-                **inputs
+            for region in nearby:
+                crop = image.crop(tuple(region.box))
+                printed_text = clean_text(
+                    pytesseract.image_to_string(preprocess_image(crop))
+                )
+
+                if printed_text:
+                    break
+
+            if printed_text:
+                captions[index] = f"_*A picture: {printed_text}*_."
+                continue
+
+            # Load the cached model only when generation is needed.
+            model, processor = load_captioning_model()
+
+            crop = image.crop(tuple(picture.box))
+
+            inputs = processor(
+                images=crop,
+                text="",
+                return_tensors="pt",
             )
 
-        caption = processor.batch_decode(
-            generated_ids,
-            skip_special_tokens=True,
-        )[0].strip()
+            # Cast image tensors, keeping token IDs as integers.
+            inputs = {
+                key: (
+                    value.to(device=model.device, dtype=model.dtype)
+                    if value.is_floating_point()
+                    else value.to(model.device)
+                )
+                for key, value in inputs.items()
+            }
 
-        captions[index] = (
-            f"A picture of {caption}."
-        )
+            with torch.inference_mode():
+                generated_ids = model.generate(
+                    **inputs,
+                    max_new_tokens=64,
+                )
+
+            description = processor.batch_decode(
+                generated_ids,
+                skip_special_tokens=True,
+            )[0].strip()
+
+            captions[index] = (
+                f"_*A picture of {description}*_."
+                if description
+                else "_*A picture*_."
+            )
 
     return captions
 
@@ -387,8 +434,10 @@ def associate_images(
         candidates = [
             text
             for text in output_texts
-            if not text.startswith(
-                "A picture of "
+            if text.strip()
+            and not (
+                text.startswith("_*")
+                and text.endswith("*_.")
             )
         ]
 

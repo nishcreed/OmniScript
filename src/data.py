@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+import base64
 
 @dataclass
 class Region:
@@ -18,31 +19,32 @@ class PageResult:
 class ReaderResult:
     text: list[str]
     pages: list[PageResult]
-    audio_path: Path | None = None
+    audio_bytes: bytes
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "text": self.text,
             "pages": [
                 {
-                    "image_path": str(page.image_path),
                     "regions": {
                         label: [
                             {
                                 "box": region.box,
-                                "score": region.score
+                                "score": region.score,
                             }
                             for region in regions
                         ]
                         for label, regions in page.regions.items()
                     },
-                    "text": page.text
+                    "text": page.text,
                 }
                 for page in self.pages
             ],
-            "audio_path": (
-                str(self.audio_path)
-                if self.audio_path is not None
-                else None
-            )
+            "audio": {
+                "mime_type": "audio/wav",
+                "encoding": "base64",
+                "data": base64.b64encode(
+                    self.audio_bytes
+                ).decode("ascii"),
+            },
         }

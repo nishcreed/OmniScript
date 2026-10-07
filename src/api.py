@@ -1,12 +1,22 @@
 from pathlib import Path
-from tempfile import NamedTemporaryFile
+from tempfile import TemporaryDirectory
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from starlette.concurrency import run_in_threadpool
 
 from src.inference import process_document
+import asyncio
+from typing import Any, Literal
 
 
 api = FastAPI(title="OmniScript API")
+
+processing_lock = asyncio.Lock() #one API request at a time
+
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+ALLOWED_EXTENSIONS = {".png", ".jpg", ".jpeg"}
+
+Language = Literal["en", "ta", "hi", "te", "ml", "kn"]
 
 @api.get("/health")
 def health() -> dict[str, str]:
@@ -14,41 +24,77 @@ def health() -> dict[str, str]:
         "status": "ok"
     }
 
+def process_upload(
+    image_bytes: bytes,
+    suffix: str,
+    language: str,
+    pitch: float,
+    speed: float
+) -> dict[str, Any]:
+    # Run blocking processing and clean up the uploaded image.
+
+    with TemporaryDirectory(prefix="omniscript-") as directory:
+        image_path = Path(directory) / f"upload{suffix}"
+        image_path.write_bytes(image_bytes)
+
+        result = process_document(
+            image_path=image_path,
+            language=language,
+            pitch=pitch,
+            speed=speed
+        )
+
+        return result.as_dict()
+
+
+
 @api.post("/process")
 async def process(
     image: UploadFile = File(...),
     language: str = Form("en"),
-    pitch: float = Form(-2),
-    speed: float = Form(1.0)
+    pitch: float = Form(-2, ge=-12, le=12),
+    speed: float = Form(1.0, ge=0.5, le=2.0)
 ):
     """
     Process one uploaded document image.
     """
 
-    filename = image.filename or "upload.png"
-    suffix = Path(filename).suffix or ".png"
-
-    image_bytes = await image.read()
-
     try:
-        with NamedTemporaryFile(
-            suffix=suffix
-        ) as temporary_file:
-            temporary_file.write(image_bytes)
+        suffix = Path(image.filename or "").suffix.lower()
 
-            temporary_file.flush()
-
-            result = process_document(
-                image_path=Path(
-                    temporary_file.name
-                ),
-                language=language,
-                pitch=pitch,
-                speed=speed
+        if suffix not in ALLOWED_EXTENSIONS:
+            raise HTTPException(
+                status_code=400,
+                detail="Upload a PNG or JPEG image."
             )
 
-            return result.as_dict()
+        image_bytes = await image.read(MAX_UPLOAD_BYTES + 1)
+
+        if not image_bytes:
+            raise HTTPException(
+                status_code=400,
+                detail="The uploaded file is empty."
+            )
+
+        if len(image_bytes) > MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail="The image must be at most 20 MB."
+            )
         
+    finally:
+        await image.close()
+
+    try:
+        async with processing_lock:
+            return await run_in_threadpool(
+                process_upload,
+                image_bytes,
+                suffix,
+                language,
+                pitch,
+                speed
+            )
     except ValueError as error:
         raise HTTPException(
             status_code=400,

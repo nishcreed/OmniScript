@@ -72,36 +72,45 @@ def resolve_overlap(
     regions: Iterable[Region],
     iou_threshold: float = 0.5,
 ) -> list[Region]:
-    """
-    Remove overlapping regions.
-
-    If two regions overlap too much, keep the one with
-    the higher confidence score.
-    """
+    """Resolve overlaps using the notebook's class preferences."""
 
     kept_regions: list[Region] = []
 
+    def should_replace(existing: Region, incoming: Region) -> bool:
+        # Prefer captions over other region types.
+        if existing.label == "Caption":
+            return False
+
+        if incoming.label == "Caption":
+            return True
+
+        # Prefer page headers when they overlap page footers.
+        if (
+            existing.label == "Page-footer"
+            and incoming.label == "Page-header"
+        ):
+            return True
+
+        if (
+            existing.label == "Page-header"
+            and incoming.label == "Page-footer"
+        ):
+            return False
+
+        # Otherwise, prefer the higher confidence score.
+        return incoming.score > existing.score
+
     for region in regions:
-        overlapping_index = None
+        for index, existing in enumerate(kept_regions):
+            overlap = calculate_iou(existing.box, region.box)
 
-        for index, kept_region in enumerate(kept_regions):
-            iou = calculate_iou(
-                region.box,
-                kept_region.box,
-            )
+            if overlap > iou_threshold:
+                if should_replace(existing, region):
+                    kept_regions[index] = region
 
-            if iou > iou_threshold:
-                overlapping_index = index
                 break
-
-        if overlapping_index is None:
+        else:
             kept_regions.append(region)
-            continue
-
-        existing_region = kept_regions[overlapping_index]
-
-        if region.score > existing_region.score:
-            kept_regions[overlapping_index] = region
 
     return kept_regions
 
@@ -234,7 +243,7 @@ def clean_text(text: str) -> str:
 
 
 def extract_text(page: PageResult) -> list[str]:
-    """Read textual regions, with headers first and footers last."""
+    """Read text and table descriptions in page order."""
 
     import pytesseract
 
@@ -247,6 +256,7 @@ def extract_text(page: PageResult) -> list[str]:
         "List-item",
         "Footnote",
         "Formula",
+        "Table",
     }
 
     headers = sort_regions(page.regions.get("Page-header", []))
@@ -264,10 +274,16 @@ def extract_text(page: PageResult) -> list[str]:
 
     with Image.open(page.image_path) as source:
         image = source.convert("RGB")
+        ocr_cache: dict[tuple[float, ...], str] = {}
 
-        for region in headers + content + footers:
-            # Keep crop coordinates within the image.
+        def read_region(region: Region) -> str:
+            key = tuple(region.box)
+
+            if key in ocr_cache:
+                return ocr_cache[key]
+
             x1, y1, x2, y2 = region.box
+
             box = (
                 max(0, min(image.width, x1)),
                 max(0, min(image.height, y1)),
@@ -276,19 +292,62 @@ def extract_text(page: PageResult) -> list[str]:
             )
 
             if box[2] <= box[0] or box[3] <= box[1]:
+                ocr_cache[key] = ""
+                return ""
+
+            crop = image.crop(box)
+            text = clean_text(
+                pytesseract.image_to_string(preprocess_image(crop))
+            )
+
+            ocr_cache[key] = text
+            return text
+
+        def read_table_description(table: Region) -> str:
+            tx1, ty1, tx2, ty2 = table.box
+
+            # Prefer Caption regions; fall back to nearby Text.
+            for label in ("Caption", "Text"):
+                candidates: list[tuple[float, Region]] = []
+
+                for candidate in page.regions.get(label, []):
+                    cx1, cy1, cx2, cy2 = candidate.box
+
+                    horizontal_overlap = (
+                        min(tx2, cx2) > max(tx1, cx1)
+                    )
+
+                    # Candidate must be above or below the table.
+                    if cy2 <= ty1:
+                        distance = ty1 - cy2
+                    elif cy1 >= ty2:
+                        distance = cy1 - ty2
+                    else:
+                        continue
+
+                    if horizontal_overlap and distance <= 40:
+                        candidates.append((distance, candidate))
+
+                candidates.sort(key=lambda item: item[0])
+
+                for _, candidate in candidates:
+                    text = read_region(candidate)
+
+                    if text:
+                        return f"_*A table: {text}*_."
+
+            return "_*A table*_."
+
+        for region in headers + content + footers:
+            if region.label == "Table":
+                extracted_text.append(read_table_description(region))
                 continue
 
-            cropped_image = image.crop(box)
-            processed_image = preprocess_image(cropped_image)
-
-            text = clean_text(
-                pytesseract.image_to_string(processed_image)
-            )
+            text = read_region(region)
 
             if not text:
                 continue
 
-            # Preserve the notebook's narration markers.
             if region.label != "Text":
                 text = f"_*{region.label}: {text}*_."
 
@@ -390,114 +449,122 @@ def associate_images(
     texts: list[str],
     captions: dict[int, str],
 ) -> list[str]:
-    """
-    Place each picture caption next to its most relevant text.
-    """
+    """Place picture captions beside the best matching sentence."""
 
-    model, processor = load_itm_model()
+    from nltk.tokenize import sent_tokenize
 
-    image = Image.open(
-        page.image_path
-    ).convert("RGB")
+    sentences: list[str] = []
 
-    image_height = image.height
+    for text in texts:
+        text = text.strip()
 
-    output_texts = list(texts)
-
-    picture_regions = page.regions.get(
-        "Picture",
-        [],
-    )
-
-    for index, region in enumerate(
-        picture_regions,
-        start=1,
-    ):
-        caption = captions[index]
-
-        y1 = region.box[1]
-        y2 = region.box[3]
-
-        if y1 < 50:
-            output_texts.insert(
-                0,
-                caption,
-            )
+        if not text:
             continue
 
-        if y2 > image_height - 50:
-            output_texts.append(
-                caption,
-            )
-            continue
+        if text.startswith("_*") and text.endswith("*_."):
+            sentences.append(text)
+        else:
+            sentences.extend(sent_tokenize(text))
 
-        candidates = [
-            text
-            for text in output_texts
-            if text.strip()
-            and not (
-                text.startswith("_*")
-                and text.endswith("*_.")
-            )
-        ]
+    # Store captions separately to preserve their order when several
+    # pictures match the same sentence.
+    first_captions: list[str] = []
+    last_captions: list[str] = []
+    captions_after: dict[int, list[str]] = {}
 
-        if not candidates:
-            output_texts.append(
-                caption,
-            )
-            continue
-
-        cropped_image = image.crop(
-            tuple(region.box)
+    candidates = [
+        (index, sentence)
+        for index, sentence in enumerate(sentences)
+        if not (
+            sentence.startswith("_*")
+            and sentence.endswith("*_.")
         )
+    ]
 
-        scores: list[float] = []
+    picture_regions = page.regions.get("Picture", [])
 
-        for candidate in candidates:
-            inputs = processor(
-                images=cropped_image,
-                text=candidate,
-                return_tensors="pt",
-            )
+    if not picture_regions:
+        return sentences
 
-            inputs = {
-                key: value.to(model.device)
-                for key, value in inputs.items()
-            }
+    with Image.open(page.image_path) as source:
+        image = source.convert("RGB")
 
-            with torch.inference_mode():
-                result = model(
-                    **inputs,
-                    use_image_text_matching_head=True,
+        for picture_index, region in enumerate(
+            picture_regions,
+            start=1,
+        ):
+            caption = captions.get(picture_index)
+
+            if not caption:
+                continue
+
+            if region.box[1] < 50:
+                first_captions.append(caption)
+                continue
+
+            if region.box[3] > image.height - 50:
+                last_captions.append(caption)
+                continue
+
+            if not candidates:
+                last_captions.append(caption)
+                continue
+
+            # The loader caches the model after the first call.
+            model, processor = load_itm_model()
+            cropped_image = image.crop(tuple(region.box))
+
+            best_sentence_index = candidates[0][0]
+            best_score = float("-inf")
+
+            for sentence_index, sentence in candidates:
+                inputs = processor(
+                    images=cropped_image,
+                    text=sentence,
+                    return_tensors="pt",
                 )
 
-            probabilities = torch.softmax(
-                result.logits_per_image,
-                dim=1,
-            )
+                inputs = {
+                    key: (
+                        value.to(
+                            device=model.device,
+                            dtype=model.dtype,
+                        )
+                        if value.is_floating_point()
+                        else value.to(model.device)
+                    )
+                    for key, value in inputs.items()
+                }
 
-            matching_probability = (
-                probabilities[0][1].item()
-            )
+                with torch.inference_mode():
+                    result = model(
+                        **inputs,
+                        use_image_text_matching_head=True,
+                    )
 
-            scores.append(
-                matching_probability
-            )
+                score = torch.softmax(
+                    result.logits_per_image,
+                    dim=-1,
+                )[0, 1].item()
 
-        best_index = scores.index(
-            max(scores)
+                if score > best_score:
+                    best_score = score
+                    best_sentence_index = sentence_index
+
+            captions_after.setdefault(
+                best_sentence_index,
+                [],
+            ).append(caption)
+
+    output_texts = list(first_captions)
+
+    for sentence_index, sentence in enumerate(sentences):
+        output_texts.append(sentence)
+        output_texts.extend(
+            captions_after.get(sentence_index, [])
         )
 
-        best_text = candidates[best_index]
-
-        insert_index = output_texts.index(
-            best_text
-        )
-
-        output_texts.insert(
-            insert_index + 1,
-            caption,
-        )
+    output_texts.extend(last_captions)
 
     return output_texts
 
@@ -629,29 +696,51 @@ def process_document(
     pitch: float = -2,
     speed: float = 1.0,
 ) -> ReaderResult:
-    """
-    Run the complete document-reading pipeline.
-    """
+    """Run layout, OCR, captioning, matching, translation, and TTS."""
 
-    page = detect_layout(
-        image_path
+    import math
+    from PIL import UnidentifiedImageError
+
+    image_path = Path(image_path)
+    language = language.strip().lower()
+
+    if language not in {"en", "ta", "hi", "te", "ml", "kn"}:
+        raise ValueError(f"Unsupported language: {language}")
+
+    if not math.isfinite(pitch) or not -12 <= pitch <= 12:
+        raise ValueError("Pitch must be between -12 and 12 semitones.")
+
+    if not math.isfinite(speed) or not 0.5 <= speed <= 2.0:
+        raise ValueError("Speed must be between 0.5 and 2.0.")
+
+    if not image_path.is_file():
+        raise ValueError(f"Image file does not exist: {image_path}")
+
+    try:
+        with Image.open(image_path) as image:
+            image.verify()
+    except (UnidentifiedImageError, OSError, SyntaxError) as error:
+        raise ValueError("Cannot read the uploaded image.") from error
+
+    page = detect_layout(image_path)
+    texts = extract_text(page)
+
+    captions = (
+        caption_images(page)
+        if page.regions.get("Picture")
+        else {}
     )
 
-    texts = extract_text(
-        page
+    # Also splits ordinary text into sentences when there are no pictures.
+    texts = associate_images(
+        page=page,
+        texts=texts,
+        captions=captions,
     )
 
-    captions = {}
-
-    if page.regions.get("Picture"):
-        captions = caption_images(
-            page
-        )
-
-        texts = associate_images(
-            page=page,
-            texts=texts,
-            captions=captions,
+    if not texts:
+        raise ValueError(
+            "No readable text or picture descriptions were found."
         )
 
     translated_texts = translate_text(
@@ -659,17 +748,20 @@ def process_document(
         language=language,
     )
 
-    output_directory = (
-        settings.create_output_directory()
-    )
+    # Reject empty narration instead of generating a silent WAV.
+    if not translated_texts or any(
+        not text.strip()
+        or (
+            text.startswith("_*")
+            and text.endswith("*_.")
+            and not text[2:-3].strip()
+        )
+        for text in translated_texts
+    ):
+        raise ValueError("Translation produced empty narration.")
 
-    audio_path = output_directory / (
-        f"{image_path.stem}_{language}.wav"
-    )
-
-    text_to_audio(
+    audio_bytes = text_to_audio(
         texts=translated_texts,
-        output_path=audio_path,
         language=language,
         pitch=pitch,
         speed=speed,
@@ -680,5 +772,5 @@ def process_document(
     return ReaderResult(
         text=translated_texts,
         pages=[page],
-        audio_path=audio_path,
+        audio_bytes=audio_bytes,
     )

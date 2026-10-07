@@ -9,6 +9,9 @@ torch
 transformers
 accelerate
 
+#ITM
+ntlk
+
 #TTS
 gtts
 pydub

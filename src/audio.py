@@ -6,6 +6,7 @@ import pyrubberband as pyrb
 import soundfile as sf
 from gtts import gTTS
 from pydub import AudioSegment
+from io import BytesIO
 
 
 def render_sentence(
@@ -79,27 +80,20 @@ def render_sentence(
 
 def text_to_audio(
     texts: list[str],
-    output_path: Path,
     language: str,
     pitch: float = -2,
     speed: float = 1.0,
-) -> Path:
-    """
-    Convert a list of text strings into one WAV file.
-    """
+) -> bytes:
+    """Generate WAV audio in memory."""
 
     target_rate = 22050
-
-    gap_duration = 0.5
-
-    gap = np.zeros(
-        int(target_rate * gap_duration),
-        dtype=np.float32,
-    )
-
-    audio_segments: list[np.ndarray] = []
+    gap = np.zeros(int(target_rate * 0.5), dtype=np.float32)
+    segments: list[np.ndarray] = []
 
     for text in texts:
+        if not text.strip():
+            continue
+
         segment = render_sentence(
             text=text,
             language=language,
@@ -108,31 +102,23 @@ def text_to_audio(
             speed=speed,
         )
 
-        audio_segments.append(segment)
-        audio_segments.append(gap)
+        if segments:
+            segments.append(gap)
 
-    if audio_segments:
-        audio_segments.pop()
+        segments.append(segment)
 
-    if audio_segments:
-        combined_audio = np.concatenate(
-            audio_segments
-        )
-    else:
-        combined_audio = np.zeros(
-            1,
-            dtype=np.float32,
-        )
+    if not segments:
+        raise ValueError("No text available for speech generation.")
 
-    output_path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    combined_audio = np.concatenate(segments)
 
+    buffer = BytesIO()
     sf.write(
-        str(output_path),
+        buffer,
         combined_audio,
         target_rate,
+        format="WAV",
+        subtype="PCM_16",
     )
 
-    return output_path
+    return buffer.getvalue()

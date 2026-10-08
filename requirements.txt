@@ -34,3 +34,4 @@ python-multipart
 
 #UI
 gradio
+httpx

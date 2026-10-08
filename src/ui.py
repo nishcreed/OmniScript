@@ -1,4 +1,5 @@
 import base64
+import logging
 import os
 from io import BytesIO
 from pathlib import Path
@@ -6,6 +7,48 @@ from pathlib import Path
 import gradio as gr
 import httpx
 import soundfile as sf
+from PIL import Image, UnidentifiedImageError
+
+logger = logging.getLogger(__name__)
+
+ALLOWED_EXTENSIONS = {".png", ".jpg", ".jpeg"}
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+
+
+def validate_image_upload(image_path: str | None) -> Path:
+    """Validate uploads before processing, with messages intended for users."""
+
+    if not image_path:
+        raise gr.Error("Upload a PNG or JPEG document image first.")
+
+    path = Path(image_path)
+
+    if path.suffix.lower() not in ALLOWED_EXTENSIONS:
+        raise gr.Error(
+            "Use a PNG or JPEG image. Convert HEIC images to PNG or JPEG first."
+        )
+
+    try:
+        size = path.stat().st_size
+        if size == 0:
+            raise gr.Error("This file is empty. Choose another image.")
+        if size > MAX_UPLOAD_BYTES:
+            raise gr.Error("Choose an image smaller than 20 MB.")
+
+        with Image.open(path) as image:
+            if image.format not in {"PNG", "JPEG"}:
+                raise gr.Error("Use a PNG or JPEG image.")
+            image.verify()
+    except (UnidentifiedImageError, Image.DecompressionBombError, SyntaxError):
+        raise gr.Error(
+            "This image cannot be read. Try another PNG or JPEG image."
+        ) from None
+    except OSError:
+        raise gr.Error(
+            "This image is unavailable or damaged. Upload it again."
+        ) from None
+
+    return path
 
 API_BASE_URL = os.getenv(
     "OMNISCRIPT_API_URL",
@@ -27,10 +70,27 @@ async def process_image(
     pitch: float,
     speed: float
 ):
-    if not image_path:
-        raise gr.Error("Upload a document image first.")
+    """Keep unexpected technical errors in logs, not in the interface."""
 
-    path = Path(image_path)
+    try:
+        return await _process_image(image_path, language, pitch, speed)
+    except gr.Error:
+        raise
+    except Exception:
+        logger.exception("Unexpected document reader failure")
+        raise gr.Error(
+            "Something went wrong while reading the document. Please try again."
+        ) from None
+
+
+async def _process_image(
+    image_path: str | None,
+    language: str,
+    pitch: float,
+    speed: float,
+):
+    path = validate_image_upload(image_path)
+
 
     timeout = httpx.Timeout(600.0, connect=10.0)
 
@@ -64,16 +124,34 @@ async def process_image(
 
     if response.is_error:
         if response.status_code >= 500:
+            logger.error("Processing API returned HTTP %s", response.status_code)
             raise gr.Error(
-                "Document processing failed. Check the server logs."
+                "Could not read this document. Please try again."
             )
 
-        try:
-            detail = response.json().get("detail", "Invalid request.")
-        except ValueError:
-            detail = "Invalid request."
+        if response.status_code == 413:
+            raise gr.Error("Choose an image smaller than 20 MB.")
 
-        raise gr.Error(str(detail))
+        if response.status_code == 422:
+            raise gr.Error("Check the selected language, pitch, and speed.")
+
+        try:
+            detail = response.json().get("detail")
+        except (ValueError, AttributeError):
+            detail = None
+
+        # Forward only recognized messages, never arbitrary backend details.
+        messages = {
+            "Cannot read the uploaded image.":
+                "This image cannot be read. Try another PNG or JPEG image.",
+            "No readable text or picture descriptions were found.":
+                "No readable content was found. Try a clearer document image.",
+            "Translation produced empty narration.":
+                "Could not translate this document. Try another language.",
+        }
+
+        message = messages.get(detail) if isinstance(detail, str) else None
+        raise gr.Error(message or "Could not read this document. Try another image.")
 
     try:
         payload = response.json()
@@ -105,9 +183,10 @@ async def process_image(
         ]
 
     except (KeyError, TypeError, ValueError, RuntimeError) as error:
+        logger.exception("Invalid processing API response")
         raise gr.Error(
-            "The API returned an invalid text or audio response."
-        ) from error
+            "Could not load the result. Please try again."
+        ) from None
 
     return "\n\n".join(lines), (sample_rate, samples)
 
@@ -127,11 +206,11 @@ def build_ui() -> gr.Blocks:
 
         with gr.Row():
             with gr.Column():
-                image = gr.Image(
-                    label="Document image",
-                    sources=["upload"],
+                image = gr.File(
+                    label="Document image (PNG or JPEG, up to 20 MB)",
+                    file_types=[".png", ".jpg", ".jpeg"],
+                    file_count="single",
                     type="filepath",
-                    format="png",
                 )
 
                 language = gr.Dropdown(
@@ -188,4 +267,3 @@ def build_ui() -> gr.Blocks:
 
     demo.queue(max_size=10)
     return demo
-

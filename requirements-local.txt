@@ -1,0 +1,9 @@
+# API/UI mock testing only; no model or TTS packages are needed.
+fastapi
+uvicorn
+python-multipart
+gradio
+httpx
+numpy
+soundfile
+Pillow

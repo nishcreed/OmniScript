@@ -4,10 +4,14 @@ from tempfile import TemporaryDirectory
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from starlette.concurrency import run_in_threadpool
 
-from src.inference import process_document
 import asyncio
+import os
 from typing import Any, Literal
 
+if os.getenv("OMNISCRIPT_MOCK", "0") == "1":
+    from src.mock_inference import process_document
+else:
+    from src.inference import process_document
 
 api = FastAPI(title="OmniScript API")
 
@@ -51,7 +55,7 @@ def process_upload(
 @api.post("/process")
 async def process(
     image: UploadFile = File(...),
-    language: str = Form("en"),
+    language: Language = Form("en"),
     pitch: float = Form(-2, ge=-12, le=12),
     speed: float = Form(1.0, ge=0.5, le=2.0)
 ):

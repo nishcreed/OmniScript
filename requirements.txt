@@ -10,7 +10,7 @@ transformers
 accelerate
 
 #ITM
-ntlk
+nltk
 
 #TTS
 gtts

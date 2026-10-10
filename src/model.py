@@ -158,24 +158,23 @@ def load_translation_model() -> tuple[Any, Any]:
     """Load the English-to-Indic model and tokenizer once."""
 
     import torch
-    from transformers import AutoModelForSeq2SeqLM
-    from IndicTransTokenizer.IndicTransTokenizer import IndicTransTokenizer
+    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-    device = settings.device
+    model_name = "ai4bharat/indictrans2-en-indic-dist-200M"
 
-    if device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = resolve_device()
+    dtype = resolve_dtype(device)
 
-    if device.startswith("cuda") and not torch.cuda.is_available():
-        raise RuntimeError(
-            "CUDA was requested, but PyTorch cannot access a GPU."
-        )
-
-    tokenizer = IndicTransTokenizer(direction="en-indic")
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name,
+        trust_remote_code=True,
+    )
 
     model = AutoModelForSeq2SeqLM.from_pretrained(
-        "ai4bharat/indictrans2-en-indic-dist-200M",
+        model_name,
         trust_remote_code=True,
+        torch_dtype=dtype,
+        attn_implementation="eager"
     )
 
     model = model.to(device)

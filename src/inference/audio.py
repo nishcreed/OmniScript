@@ -47,9 +47,12 @@ def render_sentence(
             format="mp3",
         )
 
-    audio = audio.set_frame_rate(
-        target_rate
-    ).set_channels(1)
+    audio = (
+        audio
+        .set_frame_rate(target_rate)
+        .set_channels(1)
+        .set_sample_width(2)
+    )
 
     samples = (
         np.frombuffer(

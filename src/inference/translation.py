@@ -6,7 +6,7 @@ from src.model import load_translation_model
 def translate_text(
     texts: list[str],
     language: str,
-    batch_size: int = 8,
+    batch_size: int = 4,
 ) -> list[str]:
     """
     Translate English text into an Indic language.
@@ -24,97 +24,75 @@ def translate_text(
         return texts
 
     if language not in language_codes:
-        raise ValueError(
-            f"Unsupported language: {language}"
-        )
+        raise ValueError(f"Unsupported language: {language}")
+
+    if batch_size < 1:
+        raise ValueError("Translation batch size must be positive.")
+
+    if not texts:
+        return []
 
     import torch
-
-    from IndicTransTokenizer.IndicTransTokenizer import (
-        IndicProcessor,
-    )
+    from IndicTransToolkit import IndicProcessor
 
     model, tokenizer = load_translation_model()
+    processor = IndicProcessor(inference=True)
 
     target_language = language_codes[language]
-
-    processor = IndicProcessor(
-        inference=True
-    )
-
-    special_flags = [
-        text.startswith("_*")
-        and text.endswith("*_.")
-        for text in texts
-    ]
-
-    cleaned_texts = [
-        text[2:-3] if is_special else text
-        for text, is_special in zip(
-            texts,
-            special_flags,
-        )
-    ]
-
-    device = next(
-        model.parameters()
-    ).device
-
+    device = next(model.parameters()).device
     translated_texts: list[str] = []
 
-    for start in range(
-        0,
-        len(cleaned_texts),
-        batch_size,
-    ):
-        batch_texts = cleaned_texts[
-            start:start + batch_size
+    for start in range(0, len(texts), batch_size):
+        batch = texts[start:start + batch_size]
+
+        special_flags = [
+            text.startswith("_*") and text.endswith("*_.")
+            for text in batch
         ]
 
-        batch_flags = special_flags[
-            start:start + batch_size
+        cleaned_batch = [
+            text[2:-3] if special else text
+            for text, special in zip(batch, special_flags)
         ]
 
         prepared_batch = processor.preprocess_batch(
-            batch_texts,
+            cleaned_batch,
             src_lang="eng_Latn",
             tgt_lang=target_language,
         )
 
-        tokenized_batch = tokenizer(
+        inputs = tokenizer(
             prepared_batch,
-            src=True,
-            return_tensors="pt",
             padding="longest",
+            truncation=False,
+            return_tensors="pt",
         )
 
-        tokenized_batch = {
+        inputs = {
             key: value.to(device)
-            for key, value in tokenized_batch.items()
+            for key, value in inputs.items()
         }
 
         with torch.inference_mode():
             generated_ids = model.generate(
-                **tokenized_batch,
+                **inputs,
                 num_beams=5,
                 max_length=256,
             )
 
         decoded_texts = tokenizer.batch_decode(
             generated_ids,
-            src=False,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=True,
         )
 
-        processed_texts = processor.postprocess_batch(
+        translated_batch = processor.postprocess_batch(
             decoded_texts,
             lang=target_language,
         )
 
-        for text, is_special in zip(
-            processed_texts,
-            batch_flags,
-        ):
-            if is_special:
+        for text, special in zip(translated_batch, special_flags):
+            if special:
                 text = f"_*{text}*_."
 
             translated_texts.append(text)

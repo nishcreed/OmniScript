@@ -23,6 +23,11 @@ class Settings:
         "auto"
     )
 
+    dtype: str = os.getenv(
+        "OMNISCRIPT_DTYPE",
+        "auto"
+    )
+
     tesseract_command: str = os.getenv(
         "TESSERACT_CMD",
         "tesseract"

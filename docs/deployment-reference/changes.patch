@@ -1,0 +1,1270 @@
+diff --git a/.gitignore b/.gitignore
+index 0857eee..a65bfac 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,2 +1,11 @@
+ models/
+ __pycache__/
++.venv/
++.runpod-venv/
++.env
++.env.*
++!.env.example
++artifacts/
++outputs/
++*.log
++.DS_Store
+diff --git a/Dockerfile b/Dockerfile
+index 0b097b9..df5f2fb 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -1,4 +1,4 @@
+-FROM python:3.10-slim
++FROM python:3.12-slim
+ 
+ WORKDIR /app
+ 
+@@ -9,15 +9,20 @@ RUN apt-get update && apt-get install -y \
+     rubberband-cli \
+     ffmpeg \
+     git \
++    build-essential \
++    libsndfile1 \
++    libgl1 \
+     && rm -rf /var/lib/apt/lists/*
+ 
+-COPY requirements.txt .
++COPY requirements.txt requirements-local.txt ./
+ 
+ RUN pip install --no-cache-dir -r requirements.txt
+ 
+ COPY src/ ./src/
+ COPY main.py .
+ 
++RUN python -m nltk.downloader punkt punkt_tab
++
+ EXPOSE 8000
+ 
+-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+\ No newline at end of file
++CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+diff --git a/README.md b/README.md
+index cbd13d4..43cd4f8 100644
+--- a/README.md
++++ b/README.md
+@@ -1,5 +1,28 @@
+ # OmniScript
+ 
++## Real model testing on Runpod
++
++See [the Runpod testing guide](docs/runpod-testing.md) for the full sequence.
++
++The prepared Pod commands are:
++
++```bash
++bash scripts/runpod/setup.sh
++source scripts/runpod/env.sh
++python -m scripts.download_models --stage all --check-access-only
++python -m scripts.download_models --stage all
++source scripts/runpod/env.sh
++python -m scripts.preflight
++python -m scripts.smoke --stage pipeline --image samples/text.png --repeat 2
++bash scripts/runpod/start.sh
++```
++
++Run them on the PyTorch 2.8.0 GPU Pod, not your laptop. Translation model access
++must be accepted on Hugging Face first. Setup installs the environment; downloads
++fetch weights separately. Model snapshots are cached on `/workspace`, while audio
++results remain in memory. Package your current code for transfer with
++`bash scripts/runpod/package.sh`.
++
+ ## Local API and UI checks without models
+ 
+ Use the lightweight dependencies with the project's virtual environment:
+diff --git a/requirements.txt b/requirements.txt
+index 8fe303e..1283f1d 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,37 +1,20 @@
+-#DLA
+-ultralytics
+-
+-#OCR
+-pytesseract
+-
+-#Caption
+-torch
+-transformers
+-accelerate
+-
+-#ITM
+-nltk
+-
+-#TTS
+-gtts
+-pydub
+-pyrubberband
+-resampy
+-numpy
+-soundfile
+-
+-#Indic Translation
+-sacrebleu
+-sacremoses
+-indic-nlp-library
+-git+https://github.com/VarunGumma/IndicTransTokenizer.git
+-
+-
+-#API
+-fastapi
+-uvicorn
+-python-multipart
+-
+-#UI
+-gradio
+-httpx
+\ No newline at end of file
++# Application dependencies. CUDA Torch is supplied by the Runpod template.
++-r requirements-local.txt
++torch>=2.8,<2.9
++torchvision>=0.23,<0.24
++
++# Stable API baseline for the existing BLIP-2 and IndicTrans integration.
++transformers==4.51.3
++accelerate==1.6.0
++huggingface-hub>=0.30,<1
++ultralytics==8.3.162
++pytesseract>=0.3.13,<0.4
++nltk>=3.9,<4
++
++# Maintained replacement for the old IndicTransTokenizer Git dependency.
++indictranstoolkit==1.1.1
++sentencepiece>=0.2,<0.3
++
++gtts>=2.5,<3
++pydub==0.25.1
++pyrubberband>=0.4,<0.5
+diff --git a/src/config.py b/src/config.py
+index e80df01..9c23833 100644
+--- a/src/config.py
++++ b/src/config.py
+@@ -2,12 +2,14 @@ import os
+ from dataclasses import dataclass
+ from pathlib import Path
+ 
++PROJECT_ROOT = Path(__file__).resolve().parent.parent
++
+ @dataclass(frozen=True)
+ class Settings:
+     layout_model_path: Path = Path(
+         os.getenv(
+             "OMNISCRIPT_LAYOUT_MODEL",
+-            "models/yolov8x-doclaynet-epoch64-imgsz640-initiallr1e-4-finallr1e-5.pt"
++            str(PROJECT_ROOT / "models/yolov8x-doclaynet-epoch64-imgsz640-initiallr1e-4-finallr1e-5.pt")
+         )
+     )
+ 
+@@ -23,6 +25,13 @@ class Settings:
+         "auto"
+     )
+ 
++    # auto uses BF16 on supported CUDA GPUs, FP16 otherwise; CPU uses FP32.
++    dtype: str = os.getenv("OMNISCRIPT_DTYPE", "auto")
++    caption_model: str = os.getenv("OMNISCRIPT_CAPTION_MODEL", "Salesforce/blip2-opt-2.7b")
++    itm_model: str = os.getenv("OMNISCRIPT_ITM_MODEL", "Salesforce/blip2-itm-vit-g")
++    translation_model: str = os.getenv("OMNISCRIPT_TRANSLATION_MODEL", "ai4bharat/indictrans2-en-indic-dist-200M")
++    translation_batch_size: int = int(os.getenv("OMNISCRIPT_TRANSLATION_BATCH_SIZE", "4"))
++
+     tesseract_command: str = os.getenv(
+         "TESSERACT_CMD",
+         "tesseract"
+@@ -35,4 +44,4 @@ class Settings:
+         )
+         return self.output_directory
+ 
+-settings = Settings()
+\ No newline at end of file
++settings = Settings()
+diff --git a/src/inference/__init__.py b/src/inference/__init__.py
+index 218e7be..8e79ffb 100644
+--- a/src/inference/__init__.py
++++ b/src/inference/__init__.py
+@@ -1,22 +1,26 @@
+-"""Public entry points for document inference."""
++"""Lazy stage exports keep independent stage checks lightweight."""
+ 
+-from .captioning import caption_images
+-from .layout import calculate_iou, detect_layout, resolve_overlap, sort_regions
+-from .matching import associate_images
+-from .ocr import clean_text, extract_text, preprocess_image
+-from .pipeline import process_document
+-from .translation import translate_text
++from importlib import import_module
+ 
+-__all__ = [
+-    "associate_images",
+-    "calculate_iou",
+-    "caption_images",
+-    "clean_text",
+-    "detect_layout",
+-    "extract_text",
+-    "preprocess_image",
+-    "process_document",
+-    "resolve_overlap",
+-    "sort_regions",
+-    "translate_text",
+-]
++_STAGES = {
++    "associate_images": "matching",
++    "calculate_iou": "layout",
++    "caption_images": "captioning",
++    "clean_text": "ocr",
++    "detect_layout": "layout",
++    "extract_text": "ocr",
++    "preprocess_image": "ocr",
++    "process_document": "pipeline",
++    "resolve_overlap": "layout",
++    "sort_regions": "layout",
++    "translate_text": "translation",
++}
++__all__ = list(_STAGES)
++
++
++def __getattr__(name: str):
++    if name not in _STAGES:
++        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
++    value = getattr(import_module(f".{_STAGES[name]}", __name__), name)
++    globals()[name] = value
++    return value
+diff --git a/src/inference/audio.py b/src/inference/audio.py
+index ca06863..e436ece 100644
+--- a/src/inference/audio.py
++++ b/src/inference/audio.py
+@@ -49,7 +49,7 @@ def render_sentence(
+ 
+     audio = audio.set_frame_rate(
+         target_rate
+-    ).set_channels(1)
++    ).set_channels(1).set_sample_width(2)
+ 
+     samples = (
+         np.frombuffer(
+@@ -121,4 +121,4 @@ def text_to_audio(
+         subtype="PCM_16",
+     )
+ 
+-    return buffer.getvalue()
+\ No newline at end of file
++    return buffer.getvalue()
+diff --git a/src/inference/translation.py b/src/inference/translation.py
+index 528d5fd..ae43c4d 100644
+--- a/src/inference/translation.py
++++ b/src/inference/translation.py
+@@ -1,12 +1,13 @@
+ """English-to-Indic translation with narration marker preservation."""
+ 
+ from src.model import load_translation_model
++from src.config import settings
+ 
+ 
+ def translate_text(
+     texts: list[str],
+     language: str,
+-    batch_size: int = 8,
++    batch_size: int | None = None,
+ ) -> list[str]:
+     """
+     Translate English text into an Indic language.
+@@ -28,11 +29,15 @@ def translate_text(
+             f"Unsupported language: {language}"
+         )
+ 
++    batch_size = settings.translation_batch_size if batch_size is None else batch_size
++    if batch_size < 1:
++        raise ValueError("Translation batch size must be positive.")
++    if not texts:
++        return []
++
+     import torch
+ 
+-    from IndicTransTokenizer.IndicTransTokenizer import (
+-        IndicProcessor,
+-    )
++    from IndicTransToolkit import IndicProcessor
+ 
+     model, tokenizer = load_translation_model()
+ 
+@@ -83,9 +88,9 @@ def translate_text(
+ 
+         tokenized_batch = tokenizer(
+             prepared_batch,
+-            src=True,
+             return_tensors="pt",
+             padding="longest",
++            truncation=False,
+         )
+ 
+         tokenized_batch = {
+@@ -102,7 +107,8 @@ def translate_text(
+ 
+         decoded_texts = tokenizer.batch_decode(
+             generated_ids,
+-            src=False,
++            skip_special_tokens=True,
++            clean_up_tokenization_spaces=True,
+         )
+ 
+         processed_texts = processor.postprocess_batch(
+diff --git a/src/model.py b/src/model.py
+index c5f4c72..330b492 100644
+--- a/src/model.py
++++ b/src/model.py
+@@ -1,105 +1,102 @@
++"""Cached models with explicit device placement and inference precision."""
++
+ from functools import lru_cache
+-from pathlib import Path
+ from typing import Any
+ 
+ from src.config import settings
+ 
+-#DLA
++
++def resolve_device() -> Any:
++    import torch
++
++    value = settings.device
++    if value == "auto":
++        value = "cuda:0" if torch.cuda.is_available() else "cpu"
++    device = torch.device(value)
++    if device.type not in {"cuda", "cpu"}:
++        raise ValueError("OMNISCRIPT_DEVICE must be cpu, cuda, cuda:N, or auto.")
++    if device.type == "cuda":
++        if not torch.cuda.is_available():
++            raise RuntimeError("CUDA was requested, but PyTorch cannot access a GPU.")
++        index = device.index if device.index is not None else torch.cuda.current_device()
++        if index >= torch.cuda.device_count():
++            raise ValueError(f"CUDA device {index} does not exist.")
++        device = torch.device(f"cuda:{index}")
++    return device
++
++
++def resolve_dtype(device: Any) -> Any:
++    import torch
++
++    if settings.dtype not in {"auto", "float16", "bfloat16", "float32"}:
++        raise ValueError("OMNISCRIPT_DTYPE must be auto, float16, bfloat16, or float32.")
++    if device.type == "cpu":
++        return torch.float32
++    with torch.cuda.device(device):
++        supports_bf16 = torch.cuda.is_bf16_supported()
++    if settings.dtype == "auto":
++        return torch.bfloat16 if supports_bf16 else torch.float16
++    if settings.dtype == "bfloat16" and not supports_bf16:
++        raise ValueError("This GPU does not support BF16; use float16 or auto.")
++    return getattr(torch, settings.dtype)
++
++
+ @lru_cache(maxsize=1)
+ def load_layout_model() -> Any:
+-    """
+-    Load the document layout model once.
+-    """
+-    
+     from ultralytics import YOLO
+ 
+-    model_path: Path = settings.layout_model_path
+-
+-    if not model_path.exists():
++    if not settings.layout_model_path.is_file():
+         raise FileNotFoundError(
+-            f"Layout model was not found: {model_path}"
++            f"Layout model not found: {settings.layout_model_path}. "
++            "Run python -m scripts.download_models --stage layout."
+         )
++    return YOLO(str(settings.layout_model_path)).to(str(resolve_device()))
+ 
+-    model = YOLO(str(model_path))
+ 
+-    return model
+-
+-
+-#Caption Generation
+ @lru_cache(maxsize=1)
+ def load_captioning_model() -> tuple[Any, Any]:
+-    """
+-    Load the BLIP-2 captioning model and processor once.
+-    """
+-
+-    from transformers import (
+-        Blip2ForConditionalGeneration,
+-        Blip2Processor,
+-    )
+-
+-    processor = Blip2Processor.from_pretrained(
+-        "Salesforce/blip2-opt-2.7b"
+-    )
++    from transformers import Blip2ForConditionalGeneration, Blip2Processor
+ 
++    device = resolve_device()
++    processor = Blip2Processor.from_pretrained(settings.caption_model)
+     model = Blip2ForConditionalGeneration.from_pretrained(
+-        "Salesforce/blip2-opt-2.7b",
+-        device_map="auto",
+-    )
+-
++        settings.caption_model,
++        torch_dtype=resolve_dtype(device),
++        low_cpu_mem_usage=True,
++    ).to(device)
++    model.eval()
+     return model, processor
+ 
+ 
+-#Image-Text Matching
+ @lru_cache(maxsize=1)
+ def load_itm_model() -> tuple[Any, Any]:
+-    """
+-    Load the BLIP-2 image-text matching model once.
+-    """
+-
+-    from transformers import (
+-        AutoProcessor,
+-        Blip2ForImageTextRetrieval,
+-    )
+-
+-    processor = AutoProcessor.from_pretrained(
+-        "Salesforce/blip2-itm-vit-g"
+-    )
++    from transformers import AutoProcessor, Blip2ForImageTextRetrieval
+ 
++    device = resolve_device()
++    processor = AutoProcessor.from_pretrained(settings.itm_model)
+     model = Blip2ForImageTextRetrieval.from_pretrained(
+-        "Salesforce/blip2-itm-vit-g",
+-        device_map="auto",
+-    )
+-
++        settings.itm_model,
++        torch_dtype=resolve_dtype(device),
++        low_cpu_mem_usage=True,
++    ).to(device)
++    model.eval()
+     return model, processor
+ 
+ 
+-# Translation
+ @lru_cache(maxsize=1)
+ def load_translation_model() -> tuple[Any, Any]:
+-    """Load the English-to-Indic model and tokenizer once."""
+-
+-    import torch
+-    from transformers import AutoModelForSeq2SeqLM
+-    from IndicTransTokenizer.IndicTransTokenizer import IndicTransTokenizer
+-
+-    device = settings.device
+-
+-    if device == "auto":
+-        device = "cuda" if torch.cuda.is_available() else "cpu"
+-
+-    if device.startswith("cuda") and not torch.cuda.is_available():
+-        raise RuntimeError(
+-            "CUDA was requested, but PyTorch cannot access a GPU."
+-        )
+-
+-    tokenizer = IndicTransTokenizer(direction="en-indic")
++    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+ 
++    device = resolve_device()
++    tokenizer = AutoTokenizer.from_pretrained(
++        settings.translation_model, trust_remote_code=True,
++    )
+     model = AutoModelForSeq2SeqLM.from_pretrained(
+-        "ai4bharat/indictrans2-en-indic-dist-200M",
++        settings.translation_model,
+         trust_remote_code=True,
+-    )
+-
+-    model = model.to(device)
++        torch_dtype=resolve_dtype(device),
++        low_cpu_mem_usage=True,
++        attn_implementation="eager",
++    ).to(device)
+     model.eval()
+-
+     return model, tokenizer
+diff --git a/tests/test_mock_api.py b/tests/test_mock_api.py
+index ea0aafb..2de4d2f 100644
+--- a/tests/test_mock_api.py
++++ b/tests/test_mock_api.py
+@@ -3,6 +3,8 @@
+ import base64
+ import importlib
+ import sys
++import os
++import subprocess
+ import unittest
+ import wave
+ from io import BytesIO
+@@ -72,7 +74,12 @@ class MockApiTests(unittest.TestCase):
+             self.assertEqual(self.upload().status_code, 413)
+ 
+     def test_mock_mode_does_not_import_model_stack(self):
+-        self.assertNotIn("src.inference", sys.modules)
+-        self.assertNotIn("torch", sys.modules)
+-        self.assertNotIn("transformers", sys.modules)
++        # Other test modules may import stages; check startup in isolation.
++        subprocess.run(
++            [sys.executable, "-c", "import sys; import src.api; assert 'src.inference' not in sys.modules; assert 'torch' not in sys.modules; assert 'transformers' not in sys.modules"],
++            cwd=Path(__file__).resolve().parent.parent,
++            env={**os.environ, "OMNISCRIPT_MOCK": "1"},
++            check=True,
++            capture_output=True,
++        )
+         self.assertEqual(self.client.get("/health").json(), {"status": "ok"})
+diff --git a/.dockerignore b/.dockerignore
+new file mode 100644
+index 0000000..2688013
+--- /dev/null
++++ b/.dockerignore
+@@ -0,0 +1,9 @@
++.git
++.venv
++.runpod-venv
++**/__pycache__
++.env
++.env.*
++artifacts
++outputs
++notebooks
+diff --git a/.python-version b/.python-version
+new file mode 100644
+index 0000000..e4fba21
+--- /dev/null
++++ b/.python-version
+@@ -0,0 +1 @@
++3.12
+diff --git a/requirements-gpu.txt b/requirements-gpu.txt
+new file mode 100644
+index 0000000..3fe0202
+--- /dev/null
++++ b/requirements-gpu.txt
+@@ -0,0 +1,6 @@
++# Target the preinstalled CUDA packages in Runpod PyTorch 2.8.0.
++-r requirements.txt
++torch==2.8.0
++torchvision==0.23.0
++gradio==6.28.0
++numpy>=2.1,<3
+diff --git a/docs/runpod-testing.md b/docs/runpod-testing.md
+new file mode 100644
+index 0000000..86336c4
+--- /dev/null
++++ b/docs/runpod-testing.md
+@@ -0,0 +1,135 @@
++# Runpod model testing
++
++The repo is prepared for a **Runpod PyTorch 2.8.0 NVIDIA Pod with Python 3.12**.
++Python 3.11 is also accepted by the setup checks. The GPU recipe uses the template's
++CUDA Torch in a separate environment with system-site packages; it does not use
++your Mac's Python 3.14 environment. The existing Dockerfile is a portable Python
++image, **not the GPU Pod recipe**; use the official template for these tests.
++
++## Before paying for GPU time
++
++1. Choose HTTP port **8000**, SSH access, and storage mounted at `/workspace`.
++   24 GB VRAM is a starting point with reduced precision; 48 GB gives more headroom.
++   Start with 50–100 GB of workspace storage and check actual free space.
++2. For translation, log into
++   [the AI4Bharat model page](https://huggingface.co/ai4bharat/indictrans2-en-indic-dist-200M)
++   and accept its access conditions. Create a Hugging Face read token with access
++   to that model. Keep it in your shell/Runpod secrets, never commit it.
++3. Have two PNG/JPEG pages ready: one containing only English text, another with a
++   picture in the middle of the page. The middle picture exercises semantic ITM;
++   edge pictures bypass it. Use an image without a printed caption to exercise
++   BLIP-2 generation rather than caption OCR. A table page is useful for OCR checks.
++4. Transfer the **current working tree**, not an outdated GitHub revision. From
++   your laptop run `bash scripts/runpod/package.sh`. Copy the resulting
++   `/tmp/omniscript-runpod.tar.gz` using SCP/SFTP with the direct SSH IP, port, and
++   key shown by Runpod. No model weights, local virtualenvs, or secrets are included.
++
++## On the Pod
++
++Extract the archive and set up the environment:
++
++```bash
++mkdir -p /workspace/OmniScript
++tar -xzf /path/to/omniscript-runpod.tar.gz -C /workspace/OmniScript
++cd /workspace/OmniScript
++bash scripts/runpod/setup.sh
++source scripts/runpod/env.sh
++```
++
++Setup installs Tesseract, FFmpeg, Rubber Band, build dependencies, Python packages,
++and NLTK sentence resources. It then checks CUDA, imports, versions and system
++tools. It writes an environment snapshot to `artifacts/installed-requirements.txt`.
++It does **not** download weights or run the real models.
++
++Authenticate using `hf auth login`, or set `HF_TOKEN` securely in the shell, then
++verify access before downloading large weights:
++
++```bash
++python -m scripts.download_models --stage all --check-access-only
++python -m scripts.download_models --stage all
++source scripts/runpod/env.sh
++python -m scripts.preflight
++```
++
++The layout downloader uses the exact DocLayNet checkpoint filename from the
++notebook, from
++[DILHTWD's repository](https://huggingface.co/DILHTWD/documentlayoutsegmentation_YOLOv8_ondoclaynet).
++To use your own checkpoint, export `OMNISCRIPT_LAYOUT_MODEL` to its existing path
++before running setup/download. An existing checkpoint is not overwritten.
++
++HF snapshots are stored under `HF_HOME`, default `/workspace/hf-cache`. Each model
++is resolved to a commit and its revision/path is recorded in
++`artifacts/model-manifest.json`. `artifacts/models.env` points the loaders at those
++exact local snapshots. Download progress is saved after each model, and repeated
++downloads reuse existing files. When a repo has safetensors, duplicate `.bin`
++weights are skipped. These are model caches; output WAVs are still in memory.
++
++For a faster first test, download `--stage layout` only, source the environment,
++and run layout/OCR/TTS checks below. Full preflight/start checks intentionally
++require all snapshots; download the remaining stages before starting the full UI.
++
++## Run stages in order
++
++Copy your real page images into `samples/` on the Pod, using the filenames below.
++
++```bash
++python -m scripts.smoke --stage layout --image samples/text.png
++python -m scripts.smoke --stage ocr --image samples/text.png
++python -m scripts.smoke --stage tts --text "This is an English speech test."
++python -m scripts.smoke --stage pipeline --image samples/text.png --repeat 2
++python -m scripts.smoke --stage captioning --image samples/picture.png
++python -m scripts.smoke --stage matching --image samples/picture.png
++python -m scripts.smoke --stage translation --language ta
++python -m scripts.smoke --stage pipeline --image samples/picture.png --language ta --repeat 2
++```
++
++Repeat translation for `hi`, `te`, `ml`, `kn`. Confirm translation quality yourself;
++a nonempty result is not a quality check. Table descriptions describe nearby
++captions; the application does not reconstruct table cells. Translation inputs
++are not silently truncated; very long blocks may exceed the model's input limit.
++Generation is capped at 256 tokens, as in the migrated notebook; check long blocks
++for missing content as well as normal short sentences.
++
++Reports print text/regions, elapsed seconds, audio duration, and Torch peak
++allocated/reserved VRAM. `--repeat 2` distinguishes first-load and cached-model
++timings. Torch metrics do not include every driver/process allocation; also watch
++`nvidia-smi`. Stage commands run separately, so use the final full-pipeline command
++to measure all cached models coexisting in one process.
++
++## Start and verify the application
++
++```bash
++bash scripts/runpod/start.sh
++```
++
++Keep this terminal connected during testing. Open
++`https://POD_ID-8000.proxy.runpod.net/health`, then `/reader`, from your laptop.
++Submit real pages and listen to the returned audio. A healthy API only means the
++server responds; the real request validates model execution. Do not consider
++deployment verified until the public UI completes a real request.
++
++The server is one worker, with API processing serialized. Model loaders are
++cached and use `OMNISCRIPT_DEVICE=cuda:0` by default. `OMNISCRIPT_DTYPE=auto` uses
++BF16 when supported, otherwise FP16; CPU fallback uses FP32. Models are explicitly
++placed on the selected GPU, so an OOM is visible rather than silently offloading
++to CPU. To reduce translation memory, set
++`OMNISCRIPT_TRANSLATION_BATCH_SIZE=1` before starting the process. Model placement,
++precision, and batch settings require a restart.
++
++Gradio calls the API internally at `127.0.0.1:8000`. Direct external `/process`
++requests are subject to Runpod's documented proxy timeout; record latency before
++designing the final deployment. Gradio still uses temporary playback files with
++cleanup enabled and browser run history disabled.
++
++## After testing
++
++Save observations (quality, errors, timing, VRAM) and the installed-requirements
++and model manifests before changing dependencies. The dependency baseline is
++prepared for the current integration; it has **not been validated on a GPU yet**.
++Stop or terminate the GPU when finished. Volume disk persists until Pod deletion;
++a network volume persists independently and continues billing until removed.
++
++Sources: [Runpod storage](https://docs.runpod.io/pods/storage/types),
++[Runpod networking](https://docs.runpod.io/pods/configuration/expose-ports),
++[IndicTransToolkit integration](https://github.com/VarunGumma/IndicTransToolkit),
++[BLIP-2 Transformers API](https://huggingface.co/docs/transformers/v4.51.3/en/model_doc/blip-2).
+diff --git a/scripts/__init__.py b/scripts/__init__.py
+new file mode 100644
+index 0000000..f0284c5
+--- /dev/null
++++ b/scripts/__init__.py
+@@ -0,0 +1 @@
++"""Setup and real-inference smoke checks; run from the repository with python -m."""
+diff --git a/scripts/download_models.py b/scripts/download_models.py
+new file mode 100644
+index 0000000..92cfcc7
+--- /dev/null
++++ b/scripts/download_models.py
+@@ -0,0 +1,107 @@
++"""Fetch model assets once and record exact Hub revisions and local snapshot paths."""
++
++import argparse
++import json
++import shlex
++import shutil
++from pathlib import Path
++
++from src.config import PROJECT_ROOT, settings
++
++LAYOUT_REPO = "DILHTWD/documentlayoutsegmentation_YOLOv8_ondoclaynet"
++LAYOUT_FILE = "yolov8x-doclaynet-epoch64-imgsz640-initiallr1e-4-finallr1e-5.pt"
++MODEL_SPECS = {
++    "captioning": (settings.caption_model, "OMNISCRIPT_CAPTION_MODEL"),
++    "matching": (settings.itm_model, "OMNISCRIPT_ITM_MODEL"),
++    "translation": (settings.translation_model, "OMNISCRIPT_TRANSLATION_MODEL"),
++}
++
++
++def snapshot_patterns(filenames: list[str]) -> list[str]:
++    """Avoid downloading both safetensors and duplicate PyTorch weights."""
++    weights = "*.safetensors" if any(name.endswith(".safetensors") for name in filenames) else "*.bin"
++    return [weights, "*.json", "*.txt", "*.py", "*.model", "model.SRC", "model.TGT"]
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--stage", choices=["all", "layout", *MODEL_SPECS], default="all")
++    parser.add_argument("--check-access-only", action="store_true", help="Check Hub access using small metadata/config files, without downloading weights.")
++    args = parser.parse_args()
++
++    from huggingface_hub import HfApi, hf_hub_download, snapshot_download
++
++    artifacts = PROJECT_ROOT / "artifacts"
++    manifest_path = artifacts / "model-manifest.json"
++    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
++    stages = ["layout", *MODEL_SPECS] if args.stage == "all" else [args.stage]
++    api = HfApi()
++
++    # Check every requested repo before starting any large download.
++    resolved = {}
++    for stage in stages:
++        if stage == "layout" and settings.layout_model_path.is_file():
++            print(f"layout: using existing checkpoint at {settings.layout_model_path}")
++            continue
++        repo = LAYOUT_REPO if stage == "layout" else MODEL_SPECS[stage][0]
++        if Path(repo).is_dir():
++            resolved[stage] = (repo, None)
++            continue
++        previous = manifest.get(stage, {})
++        revision = previous.get("revision") if previous.get("repo") == repo else None
++        info = api.model_info(repo, revision=revision)
++        if stage != "layout":
++            hf_hub_download(repo, "config.json", revision=info.sha)
++        resolved[stage] = (repo, info)
++        print(f"{stage}: access OK ({info.sha})")
++
++    if args.check_access_only:
++        print("Access checks passed. No model weights downloaded.")
++        return
++
++    artifacts.mkdir(parents=True, exist_ok=True)
++    for stage in stages:
++        if stage == "layout":
++            destination = settings.layout_model_path.resolve()
++            if not destination.is_file():
++                repo, info = resolved[stage]
++                cached = hf_hub_download(repo, LAYOUT_FILE, revision=info.sha)
++                destination.parent.mkdir(parents=True, exist_ok=True)
++                shutil.copy2(cached, destination)
++                manifest[stage] = {"repo": repo, "revision": info.sha, "path": str(destination)}
++            else:
++                manifest.setdefault(stage, {"path": str(destination), "source": "existing checkpoint"})
++        else:
++            repo, info = resolved[stage]
++            if info is None:
++                destination = Path(repo).resolve()
++                manifest.setdefault(stage, {"path": str(destination), "source": "existing snapshot"})
++            else:
++                destination = Path(snapshot_download(
++                    repo_id=repo,
++                    revision=info.sha,
++                    allow_patterns=snapshot_patterns([file.rfilename for file in info.siblings]),
++                ))
++                manifest[stage] = {"repo": repo, "revision": info.sha, "path": str(destination)}
++
++        # Save incremental progress, so interrupted all-model downloads can resume.
++        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
++        variables = []
++        for name, entry in manifest.items():
++            key = "OMNISCRIPT_LAYOUT_MODEL" if name == "layout" else MODEL_SPECS[name][1]
++            variables.append(f"export {key}={shlex.quote(entry['path'])}")
++        (artifacts / "models.env").write_text("\n".join(variables) + "\n")
++        print(f"{stage}: ready at {destination}")
++
++    print("Run: source scripts/runpod/env.sh")
++
++
++if __name__ == "__main__":
++    try:
++        main()
++    except Exception as error:
++        raise SystemExit(
++            f"Model download failed: {error}\n"
++            "For gated translation weights, accept access on the AI4Bharat model page "
++            "and authenticate with HF_TOKEN or hf auth login."
++        ) from None
+diff --git a/scripts/preflight.py b/scripts/preflight.py
+new file mode 100644
+index 0000000..c2e77c0
+--- /dev/null
++++ b/scripts/preflight.py
+@@ -0,0 +1,78 @@
++"""Check the Pod environment before spending time loading model weights."""
++
++import argparse
++import importlib
++import json
++import shutil
++import sys
++from pathlib import Path
++
++from src.config import PROJECT_ROOT, settings
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--allow-missing-models", action="store_true")
++    args = parser.parse_args()
++    failures = []
++
++    def check(label, ok, detail):
++        print(f"{'OK' if ok else 'FAIL'} {label}: {detail}")
++        if not ok:
++            failures.append(label)
++
++    check("Python", (3, 11) <= sys.version_info[:2] <= (3, 12), sys.version.split()[0])
++    for executable in ("ffmpeg", "rubberband", settings.tesseract_command):
++        found = shutil.which(executable)
++        check(executable, bool(found), found or "missing system package")
++
++    for module in ("torch", "torchvision", "transformers", "accelerate", "ultralytics", "pytesseract", "nltk", "gtts", "pydub", "pyrubberband", "soundfile", "gradio", "httpx", "IndicTransToolkit", "sentencepiece"):
++        try:
++            loaded = importlib.import_module(module)
++            check(module, True, getattr(loaded, "__version__", "importable"))
++        except Exception as error:
++            check(module, False, str(error))
++
++    try:
++        import torch
++        from src.model import resolve_device, resolve_dtype
++
++        check("CUDA", torch.cuda.is_available(), torch.version.cuda)
++        device = resolve_device()
++        if device.type == "cuda":
++            print(f"GPU: {torch.cuda.get_device_name(device)}")
++            print(f"VRAM: {torch.cuda.get_device_properties(device).total_memory / 2**30:.1f} GiB")
++        print(f"Selected device/dtype: {device}/{resolve_dtype(device)}")
++        check("Torch baseline", torch.__version__.split("+")[0] == "2.8.0", torch.__version__)
++        from transformers import Blip2ForConditionalGeneration, Blip2ForImageTextRetrieval, AutoTokenizer
++        print("BLIP-2 and translation classes: importable")
++    except Exception as error:
++        check("GPU/model API", False, str(error))
++
++    try:
++        import nltk
++        from nltk.tokenize import sent_tokenize
++        check("Sentence tokenizer", len(sent_tokenize("First sentence. Second sentence.")) == 2, "punkt resources")
++    except Exception as error:
++        check("Sentence tokenizer", False, str(error))
++
++    if not args.allow_missing_models:
++        check("Layout checkpoint", settings.layout_model_path.is_file(), str(settings.layout_model_path))
++        for name, value in (("Caption", settings.caption_model), ("Matching", settings.itm_model), ("Translation", settings.translation_model)):
++            path = Path(value)
++            has_weights = path.is_dir() and (
++                any(path.glob("*.safetensors")) or any(path.glob("*.bin"))
++            )
++            check(f"{name} snapshot", has_weights and (path / "config.json").is_file(), value)
++
++    free = shutil.disk_usage(PROJECT_ROOT).free / 2**30
++    print(f"Free repository storage: {free:.1f} GiB")
++    print("TTS requires outbound internet access to Google; verify with the tts smoke stage.")
++    artifacts = PROJECT_ROOT / "artifacts"
++    artifacts.mkdir(exist_ok=True)
++    (artifacts / "preflight.json").write_text(json.dumps({"python": sys.version, "failures": failures, "free_disk_gib": free}, indent=2) + "\n")
++    return int(bool(failures))
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/scripts/smoke.py b/scripts/smoke.py
+new file mode 100644
+index 0000000..28fbb11
+--- /dev/null
++++ b/scripts/smoke.py
+@@ -0,0 +1,86 @@
++"""Run real stages separately or the full pipeline with timing and GPU memory."""
++
++import argparse
++import json
++import time
++import wave
++from io import BytesIO
++from pathlib import Path
++
++
++def audio_summary(wav_bytes):
++    with wave.open(BytesIO(wav_bytes)) as audio:
++        return {"audio_bytes": len(wav_bytes), "audio_seconds": round(audio.getnframes() / audio.getframerate(), 2)}
++
++
++def run_stage(stage, image_path, language, text):
++    if stage == "translation":
++        from src.inference.translation import translate_text
++        return {"text": translate_text([text], language)}
++    if stage == "tts":
++        from src.inference.audio import text_to_audio
++        return audio_summary(text_to_audio([text], language=language))
++    if image_path is None or not image_path.is_file():
++        raise ValueError("Supply --image with an existing document image.")
++    if stage == "pipeline":
++        from src.inference import process_document
++        result = process_document(image_path, language=language)
++        return {"text": result.text, **audio_summary(result.audio_bytes)}
++
++    from src.inference.layout import detect_layout
++    page = detect_layout(image_path)
++    summary = {"regions": {label: len(regions) for label, regions in page.regions.items()}}
++    if stage == "layout":
++        return summary
++    if stage in {"ocr", "matching"}:
++        from src.inference.ocr import extract_text
++        texts = extract_text(page)
++        summary["text"] = texts
++    if stage in {"captioning", "matching"}:
++        if not page.regions.get("Picture"):
++            raise ValueError("No Picture regions detected; use a document containing a picture.")
++        from src.inference.captioning import caption_images
++        captions = caption_images(page)
++        summary["captions"] = captions
++        if stage == "matching":
++            from src.inference.matching import associate_images
++            summary["text"] = associate_images(page, texts, captions)
++    return summary
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--stage", choices=["layout", "ocr", "captioning", "matching", "translation", "tts", "pipeline"], required=True)
++    parser.add_argument("--image", type=Path)
++    parser.add_argument("--language", choices=["en", "ta", "hi", "te", "ml", "kn"], default="en")
++    parser.add_argument("--text", default="A bird is sitting on a tree branch.")
++    parser.add_argument("--repeat", type=int, default=1)
++    args = parser.parse_args()
++    if args.repeat < 1:
++        parser.error("--repeat must be positive")
++    if args.stage == "translation" and args.language == "en":
++        parser.error("Use a non-English language to test the translation model")
++
++    import torch
++    from src.model import resolve_device
++    device = resolve_device()
++    for index in range(args.repeat):
++        if device.type == "cuda":
++            torch.cuda.synchronize(device)
++            torch.cuda.reset_peak_memory_stats(device)
++        started = time.perf_counter()
++        result = run_stage(args.stage, args.image, args.language, args.text)
++        if device.type == "cuda":
++            torch.cuda.synchronize(device)
++        report = {"stage": args.stage, "run": index + 1, "seconds": round(time.perf_counter() - started, 2), **result}
++        if device.type == "cuda":
++            report["torch_peak_allocated_gib"] = round(torch.cuda.max_memory_allocated(device) / 2**30, 2)
++            report["torch_peak_reserved_gib"] = round(torch.cuda.max_memory_reserved(device) / 2**30, 2)
++        print(json.dumps(report, ensure_ascii=False, indent=2))
++
++
++if __name__ == "__main__":
++    try:
++        main()
++    except Exception as error:
++        raise SystemExit(f"Smoke check failed: {type(error).__name__}: {error}") from None
+diff --git a/scripts/runpod/env.sh b/scripts/runpod/env.sh
+new file mode 100644
+index 0000000..754375d
+--- /dev/null
++++ b/scripts/runpod/env.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++# Source this from the Pod shell; creation-time variables may not reach SSH shells.
++OMNISCRIPT_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
++export HF_HOME="${HF_HOME:-/workspace/hf-cache}"
++export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/workspace/pip-cache}"
++export UV_CACHE_DIR="${UV_CACHE_DIR:-/workspace/uv-cache}"
++export NLTK_DATA="${NLTK_DATA:-/workspace/nltk_data}"
++export OMNISCRIPT_MOCK=0
++export OMNISCRIPT_DEVICE="${OMNISCRIPT_DEVICE:-cuda:0}"
++export OMNISCRIPT_DTYPE="${OMNISCRIPT_DTYPE:-auto}"
++export OMNISCRIPT_TRANSLATION_BATCH_SIZE="${OMNISCRIPT_TRANSLATION_BATCH_SIZE:-4}"
++export OMNISCRIPT_LAYOUT_MODEL="${OMNISCRIPT_LAYOUT_MODEL:-$OMNISCRIPT_REPO_ROOT/models/yolov8x-doclaynet-epoch64-imgsz640-initiallr1e-4-finallr1e-5.pt}"
++export OMNISCRIPT_API_URL="${OMNISCRIPT_API_URL:-http://127.0.0.1:8000}"
++export OMNISCRIPT_VENV="${OMNISCRIPT_VENV:-$OMNISCRIPT_REPO_ROOT/.runpod-venv}"
++if [[ -f "$OMNISCRIPT_REPO_ROOT/artifacts/models.env" ]]; then
++    source "$OMNISCRIPT_REPO_ROOT/artifacts/models.env"
++fi
++if [[ -f "$OMNISCRIPT_VENV/bin/activate" ]]; then
++    source "$OMNISCRIPT_VENV/bin/activate"
++fi
+diff --git a/scripts/runpod/setup.sh b/scripts/runpod/setup.sh
+new file mode 100644
+index 0000000..17801f9
+--- /dev/null
++++ b/scripts/runpod/setup.sh
+@@ -0,0 +1,44 @@
++#!/usr/bin/env bash
++set -euo pipefail
++source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
++cd "$OMNISCRIPT_REPO_ROOT"
++
++if [[ "$(uname -s)" != Linux ]]; then
++    echo 'Run this script on the Linux Runpod Pod, not on your laptop.' >&2
++    exit 1
++fi
++python3 - <<'PY'
++import sys
++import torch
++assert (3, 11) <= sys.version_info[:2] <= (3, 12), 'Use a Python 3.11/3.12 PyTorch template.'
++assert torch.__version__.split('+')[0] == '2.8.0', 'Use Runpod PyTorch 2.8.0.'
++assert torch.cuda.is_available(), 'CUDA is unavailable; check the template/GPU before installing.'
++print('GPU:', torch.cuda.get_device_name(0))
++PY
++if [[ "$EUID" -ne 0 ]]; then
++    echo 'Run setup as root in the official Runpod PyTorch template.' >&2
++    exit 1
++fi
++apt-get update
++DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
++    tesseract-ocr ffmpeg rubberband-cli libsndfile1 libgl1 libglib2.0-0 \
++    build-essential python3-dev python3-venv git
++mkdir -p "$HF_HOME" "$PIP_CACHE_DIR" "$UV_CACHE_DIR" "$NLTK_DATA" artifacts
++if [[ ! -f "$OMNISCRIPT_VENV/bin/python" ]]; then
++    if command -v uv >/dev/null 2>&1; then
++        uv venv --seed --system-site-packages --python "$(command -v python3)" "$OMNISCRIPT_VENV"
++    else
++        python3 -m venv --system-site-packages "$OMNISCRIPT_VENV"
++    fi
++fi
++source "$OMNISCRIPT_VENV/bin/activate"
++if command -v uv >/dev/null 2>&1; then
++    uv pip install --python "$OMNISCRIPT_VENV/bin/python" -r requirements-gpu.txt
++else
++    python -m pip install -r requirements-gpu.txt
++fi
++python -m nltk.downloader -d "$NLTK_DATA" punkt punkt_tab
++python -m pip check
++python -m pip freeze > artifacts/installed-requirements.txt
++python -m scripts.preflight --allow-missing-models
++echo 'Environment ready. Next: python -m scripts.download_models --stage all'
+diff --git a/scripts/runpod/start.sh b/scripts/runpod/start.sh
+new file mode 100644
+index 0000000..3f697d5
+--- /dev/null
++++ b/scripts/runpod/start.sh
+@@ -0,0 +1,6 @@
++#!/usr/bin/env bash
++set -euo pipefail
++source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
++cd "$OMNISCRIPT_REPO_ROOT"
++python -m scripts.preflight
++exec python -m uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
+diff --git a/scripts/runpod/package.sh b/scripts/runpod/package.sh
+new file mode 100644
+index 0000000..490bec3
+--- /dev/null
++++ b/scripts/runpod/package.sh
+@@ -0,0 +1,10 @@
++#!/usr/bin/env bash
++set -euo pipefail
++OMNISCRIPT_PACKAGE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
++cd "$OMNISCRIPT_PACKAGE_ROOT"
++OMNISCRIPT_ARCHIVE="${1:-/tmp/omniscript-runpod.tar.gz}"
++# Include only code/configuration, never local environments, secrets, or weights.
++tar --exclude='__pycache__' --exclude='*.pyc' -czf "$OMNISCRIPT_ARCHIVE" \
++    src scripts tests docs main.py README.md Dockerfile \
++    requirements.txt requirements-local.txt requirements-gpu.txt .python-version
++echo "Created $OMNISCRIPT_ARCHIVE. Extract under /workspace/OmniScript on the Pod."
+diff --git a/tests/test_gpu_preparation.py b/tests/test_gpu_preparation.py
+new file mode 100644
+index 0000000..89d2f7a
+--- /dev/null
++++ b/tests/test_gpu_preparation.py
+@@ -0,0 +1,165 @@
++"""Verify model configuration and translation wiring without installing Torch."""
++
++import importlib
++import subprocess
++import sys
++import tempfile
++import unittest
++from contextlib import nullcontext
++from dataclasses import replace
++from types import ModuleType, SimpleNamespace
++from pathlib import Path
++from unittest.mock import MagicMock, patch
++
++
++class Device:
++    def __init__(self, value):
++        parts = str(value).split(":")
++        self.type = parts[0]
++        self.index = int(parts[1]) if len(parts) > 1 else None
++
++    def __str__(self):
++        return self.type if self.index is None else f"{self.type}:{self.index}"
++
++
++class ModelConfigurationTests(unittest.TestCase):
++    def setUp(self):
++        self.models = importlib.import_module("src.model")
++        self.torch = ModuleType("torch")
++        self.torch.device = Device
++        for dtype in ("float16", "bfloat16", "float32"):
++            setattr(self.torch, dtype, dtype)
++        self.torch.cuda = MagicMock()
++        self.torch.cuda.is_available.return_value = True
++        self.torch.cuda.device_count.return_value = 1
++        self.torch.cuda.current_device.return_value = 0
++        self.torch.cuda.is_bf16_supported.return_value = True
++        self.torch.cuda.device.side_effect = lambda device: nullcontext()
++        self.addCleanup(self.models.load_captioning_model.cache_clear)
++        self.models.load_captioning_model.cache_clear()
++
++    def test_auto_uses_bf16_cuda_and_fp32_cpu(self):
++        with patch.dict(sys.modules, {"torch": self.torch}), patch.object(self.models, "settings", replace(self.models.settings, device="auto", dtype="auto")):
++            device = self.models.resolve_device()
++            self.assertEqual(str(device), "cuda:0")
++            self.assertEqual(self.models.resolve_dtype(device), "bfloat16")
++            self.torch.cuda.is_available.return_value = False
++            device = self.models.resolve_device()
++            self.assertEqual(str(device), "cpu")
++            self.assertEqual(self.models.resolve_dtype(device), "float32")
++
++    def test_auto_falls_back_to_fp16_on_gpu_without_bf16(self):
++        self.torch.cuda.is_bf16_supported.return_value = False
++        with patch.dict(sys.modules, {"torch": self.torch}), patch.object(self.models, "settings", replace(self.models.settings, dtype="auto")):
++            self.assertEqual(self.models.resolve_dtype(Device("cuda:0")), "float16")
++
++    def test_explicit_cuda_fails_if_gpu_missing(self):
++        self.torch.cuda.is_available.return_value = False
++        with patch.dict(sys.modules, {"torch": self.torch}), patch.object(self.models, "settings", replace(self.models.settings, device="cuda")):
++            with self.assertRaisesRegex(RuntimeError, "cannot access a GPU"):
++                self.models.resolve_device()
++
++    def test_caption_loader_places_model_and_caches_it(self):
++        transformers = ModuleType("transformers")
++        transformers.Blip2Processor = MagicMock()
++        transformers.Blip2ForConditionalGeneration = MagicMock()
++        loaded = MagicMock()
++        loaded.to.return_value = loaded
++        transformers.Blip2ForConditionalGeneration.from_pretrained.return_value = loaded
++        with patch.dict(sys.modules, {"torch": self.torch, "transformers": transformers}), patch.object(self.models, "settings", replace(self.models.settings, device="cuda", dtype="auto")):
++            first = self.models.load_captioning_model()
++            second = self.models.load_captioning_model()
++        self.assertIs(first, second)
++        self.assertEqual(transformers.Blip2ForConditionalGeneration.from_pretrained.call_args.kwargs["torch_dtype"], "bfloat16")
++        self.assertEqual(str(loaded.to.call_args.args[0]), "cuda:0")
++        loaded.eval.assert_called_once()
++        transformers.Blip2ForConditionalGeneration.from_pretrained.assert_called_once()
++
++    def test_stage_import_does_not_import_torch_or_audio(self):
++        subprocess.run(
++            [sys.executable, "-c", "import sys; from src.inference.layout import calculate_iou; assert calculate_iou([0,0,1,1], [0,0,1,1]) == 1; assert 'torch' not in sys.modules; assert 'src.inference.audio' not in sys.modules"],
++            check=True, capture_output=True,
++        )
++
++
++class TranslationWiringTests(unittest.TestCase):
++    def test_hf_tokenizer_interface_and_marker_restoration(self):
++        translation = importlib.import_module("src.inference.translation")
++        torch = ModuleType("torch")
++        torch.inference_mode = nullcontext
++        toolkit = ModuleType("IndicTransToolkit")
++        processor = MagicMock()
++        processor.preprocess_batch.side_effect = lambda batch, **kwargs: batch
++        processor.postprocess_batch.side_effect = lambda batch, **kwargs: batch
++        toolkit.IndicProcessor = MagicMock(return_value=processor)
++
++        class Tokenizer:
++            # Old src=True/src=False flags will fail against this HF interface.
++            def __call__(self, texts, *, return_tensors, padding, truncation):
++                if truncation:
++                    raise AssertionError("Do not silently discard document text")
++                return {"input_ids": SimpleNamespace(to=lambda device: texts)}
++
++            def batch_decode(self, tokens, *, skip_special_tokens, clean_up_tokenization_spaces):
++                return [f"Translated {text}" for text in tokens]
++
++        model = MagicMock()
++        model.parameters.side_effect = lambda: iter([SimpleNamespace(device="cuda:0")])
++        model.generate.side_effect = lambda **kwargs: kwargs["input_ids"]
++        with patch.dict(sys.modules, {"torch": torch, "IndicTransToolkit": toolkit}), patch.object(translation, "load_translation_model", return_value=(model, Tokenizer())):
++            result = translation.translate_text(["Hello.", "_*A picture*_."], "ta", batch_size=1)
++        self.assertEqual(result, ["Translated Hello.", "_*Translated A picture*_."])
++        self.assertEqual(model.generate.call_count, 2)
++
++    def test_english_and_empty_inputs_do_not_load_model(self):
++        translation = importlib.import_module("src.inference.translation")
++        with patch.object(translation, "load_translation_model") as loader:
++            self.assertEqual(translation.translate_text(["Hello"], "en"), ["Hello"])
++            self.assertEqual(translation.translate_text([], "ta"), [])
++            loader.assert_not_called()
++
++
++class DownloadPreparationTests(unittest.TestCase):
++    def test_safetensors_avoids_duplicate_weights(self):
++        from scripts.download_models import snapshot_patterns
++        self.assertIn("*.safetensors", snapshot_patterns(["model.safetensors", "pytorch_model.bin"]))
++        self.assertNotIn("*.bin", snapshot_patterns(["model.safetensors", "pytorch_model.bin"]))
++        self.assertIn("*.bin", snapshot_patterns(["pytorch_model.bin"]))
++
++    def test_access_check_does_not_download_weights_and_full_run_records_snapshots(self):
++        import json
++        from scripts import download_models
++
++        hub = ModuleType("huggingface_hub")
++        api = MagicMock()
++        api.model_info.return_value = SimpleNamespace(
++            sha="abc123",
++            siblings=[SimpleNamespace(rfilename="model.safetensors")],
++        )
++        hub.HfApi = MagicMock(return_value=api)
++
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            config = root / "config.json"
++            config.write_text("{}")
++            weights = root / "cached.pt"
++            weights.write_bytes(b"mock checkpoint")
++            snapshot = root / "snapshot"
++            snapshot.mkdir()
++            (snapshot / "config.json").write_text("{}")
++            hub.hf_hub_download = MagicMock(side_effect=lambda repo, filename, **kwargs: str(weights if filename.endswith(".pt") else config))
++            hub.snapshot_download = MagicMock(return_value=str(snapshot))
++            settings = replace(download_models.settings, layout_model_path=root / "models/layout.pt")
++            with patch.dict(sys.modules, {"huggingface_hub": hub}), patch.object(download_models, "PROJECT_ROOT", root), patch.object(download_models, "settings", settings), patch("builtins.print"):
++                with patch.object(sys, "argv", ["download_models", "--check-access-only"]):
++                    download_models.main()
++                hub.snapshot_download.assert_not_called()
++                self.assertTrue(all(call.args[1] == "config.json" for call in hub.hf_hub_download.call_args_list))
++                self.assertFalse(settings.layout_model_path.exists())
++                with patch.object(sys, "argv", ["download_models"]):
++                    download_models.main()
++                manifest = json.loads((root / "artifacts/model-manifest.json").read_text())
++                self.assertEqual(set(manifest), {"layout", "captioning", "matching", "translation"})
++                self.assertTrue(all(entry["revision"] == "abc123" for entry in manifest.values()))
++                self.assertEqual(settings.layout_model_path.read_bytes(), b"mock checkpoint")
++                self.assertIn("OMNISCRIPT_TRANSLATION_MODEL", (root / "artifacts/models.env").read_text())

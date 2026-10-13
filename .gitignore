@@ -1,2 +1,7 @@
 models/
 __pycache__/
+huggingface-token.txt
+.venv/
+.runpod-venv/
+.env
+.env.*

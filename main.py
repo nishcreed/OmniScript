@@ -7,6 +7,5 @@ app = gr.mount_gradio_app(
     blocks=build_ui(),
     path="/reader",
     show_error=False,
-    run_history=False,
     max_file_size="20mb"
 )

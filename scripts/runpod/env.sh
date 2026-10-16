@@ -7,6 +7,9 @@ export OMNISCRIPT_LAYOUT_MODEL=/workspace/models/yolov8x-doclaynet-epoch64-imgsz
 # Temporary package download cache.
 export PIP_CACHE_DIR=/tmp/pip-cache
 
+# Custom Transformers modules require filesystem permission operations.
+export HF_MODULES_CACHE=/tmp/omniscript-hf-modules
+
 export OMNISCRIPT_MOCK=0
 export OMNISCRIPT_DEVICE=cuda:0
 export OMNISCRIPT_DTYPE=auto
@@ -14,4 +17,4 @@ export OMNISCRIPT_DTYPE=auto
 export TESSERACT_CMD=/usr/bin/tesseract
 export OMNISCRIPT_API_URL=http://127.0.0.1:8000
 
-mkdir -p "$HF_HOME" "$PIP_CACHE_DIR" "$NLTK_DATA" /workspace/models
+mkdir -p "$HF_HOME" "$PIP_CACHE_DIR" "$HF_MODULES_CACHE" "$NLTK_DATA" /workspace/models

@@ -1,5 +1,6 @@
 # Persistent model assets.
 export HF_HOME=/workspace/hf-cache
+export HF_HUB_ENABLE_HF_TRANSFER=0
 export NLTK_DATA=/workspace/nltk_data
 export OMNISCRIPT_LAYOUT_MODEL=/workspace/models/yolov8x-doclaynet-epoch64-imgsz640-initiallr1e-4-finallr1e-5.pt
 

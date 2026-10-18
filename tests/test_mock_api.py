@@ -76,3 +76,16 @@ class MockApiTests(unittest.TestCase):
         self.assertNotIn("torch", sys.modules)
         self.assertNotIn("transformers", sys.modules)
         self.assertEqual(self.client.get("/health").json(), {"status": "ok"})
+
+    def test_preload_failure_prevents_startup(self):
+        with patch.dict("os.environ", {"OMNISCRIPT_PRELOAD": "1", "OMNISCRIPT_MOCK": "0"}):
+            with patch("src.model.load_layout_model", autospec=True, side_effect=RuntimeError("Model unavailable")):
+                with self.assertRaisesRegex(RuntimeError, "Model unavailable"):
+                    with TestClient(self.api_module.api):
+                        self.fail("Startup accepted a failed model load")
+
+    def test_mock_startup_skips_preloading_when_enabled(self):
+        with patch.dict("os.environ", {"OMNISCRIPT_PRELOAD": "1", "OMNISCRIPT_MOCK": "1"}):
+            with patch("src.model.load_layout_model", side_effect=AssertionError("Unexpected model load")):
+                with TestClient(self.api_module.api) as client:
+                    self.assertEqual(client.get("/health").status_code, 200)

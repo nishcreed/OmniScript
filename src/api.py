@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -5,6 +6,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from starlette.concurrency import run_in_threadpool
 
 import asyncio
+import logging
 import os
 from typing import Any, Literal
 
@@ -13,7 +15,39 @@ if os.getenv("OMNISCRIPT_MOCK", "0") == "1":
 else:
     from src.inference import process_document
 
-api = FastAPI(title="OmniScript API")
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    preload = os.getenv("OMNISCRIPT_PRELOAD", "0") == "1"
+    mock = os.getenv("OMNISCRIPT_MOCK", "0") == "1"
+
+    if preload and not mock:
+        from src.model import (
+            load_captioning_model,
+            load_itm_model,
+            load_layout_model,
+            load_translation_model,
+        )
+
+        loaders = (
+            load_layout_model,
+            load_captioning_model,
+            load_itm_model,
+            load_translation_model,
+        )
+
+        for loader in loaders:
+            logger.info("Loading %s", loader.__name__)
+            await run_in_threadpool(loader)
+
+        logger.info("All models loaded")
+
+    yield
+
+
+api = FastAPI(title="OmniScript API", lifespan=lifespan)
 
 processing_lock = asyncio.Lock() #one API request at a time
 

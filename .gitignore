@@ -5,3 +5,4 @@ huggingface-token.txt
 .runpod-venv/
 .env
 .env.*
+.DS_Store

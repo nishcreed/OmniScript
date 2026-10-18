@@ -1,5 +1,8 @@
 # OmniScript
 
+See [hardware requirements and measured resource usage](docs/hardware-requirements.md)
+for the tested Runpod configuration and capacity-planning limits.
+
 ## Local API and UI checks without models
 
 Use the lightweight dependencies with the project's virtual environment:

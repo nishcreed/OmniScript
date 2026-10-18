@@ -1,0 +1,16 @@
+.git/
+.venv/
+.runpod-venv/
+__pycache__/
+*.pyc
+
+.env
+.env.*
+huggingface-token.txt
+
+models/
+outputs/
+notebooks/
+docs/
+tests/
+.DS_Store

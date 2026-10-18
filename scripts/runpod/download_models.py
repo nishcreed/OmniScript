@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 
 from src.config import settings
@@ -7,6 +10,28 @@ MODEL_REPOSITORIES = (
     "Salesforce/blip2-itm-vit-g",
     "ai4bharat/indictrans2-en-indic-dist-200M",
 )
+
+
+def validate_json_files(repo_id: str, snapshot_path: str, files: list[str]) -> None:
+    snapshot = Path(snapshot_path)
+
+    for filename in files:
+        if not filename.endswith(".json"):
+            continue
+
+        path = snapshot / filename
+        try:
+            json.loads(path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            print(f"Refreshing invalid JSON: {repo_id}/{filename}", flush=True)
+            repaired_path = hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                revision=snapshot.name,
+                force_download=True,
+            )
+            # Fail startup if the refreshed file is still unreadable or invalid.
+            json.loads(Path(repaired_path).read_text(encoding="utf-8"))
 
 def download_layout() -> None:
     model_path = settings.layout_model_path
@@ -49,6 +74,7 @@ def download_transformer_models() -> None:
             max_workers=4,
         )
 
+        validate_json_files(repo_id, snapshot_path, files)
         print(f"Cached at: {snapshot_path}", flush=True)
 
 

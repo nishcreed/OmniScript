@@ -91,13 +91,19 @@ async def _process_image(
 ):
     path = validate_image_upload(image_path)
 
-
+    api_key = os.getenv("RUNPOD_API_KEY")
+    headers = (
+        {"Authorization": f"Bearer {api_key}"}
+        if api_key
+        else {}
+    )
     timeout = httpx.Timeout(600.0, connect=10.0)
 
     try:
         async with httpx.AsyncClient(
             timeout=timeout,
             trust_env=False,
+            headers=headers
         ) as client:
             with path.open("rb") as image_file:
                 response = await client.post(

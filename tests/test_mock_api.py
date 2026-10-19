@@ -76,6 +76,8 @@ class MockApiTests(unittest.TestCase):
         self.assertNotIn("torch", sys.modules)
         self.assertNotIn("transformers", sys.modules)
         self.assertEqual(self.client.get("/health").json(), {"status": "ok"})
+        self.assertEqual(self.client.get("/ping").status_code, 200)
+        self.assertEqual(self.client.get("/ping").json(), {"status": "ok"})
 
     def test_preload_failure_prevents_startup(self):
         with patch.dict("os.environ", {"OMNISCRIPT_PRELOAD": "1", "OMNISCRIPT_MOCK": "0"}):

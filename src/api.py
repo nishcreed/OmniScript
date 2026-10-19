@@ -56,6 +56,7 @@ ALLOWED_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 
 Language = Literal["en", "ta", "hi", "te", "ml", "kn"]
 
+@api.get("/ping", include_in_schema=False)
 @api.get("/health")
 def health() -> dict[str, str]:
     return {

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Run from the repository root.
-cd "$(dirname "${BASH_SOURCE[0]}")/../.."
+cd "$(dirname "${BASH_SOURCE[0]}")/../../.."
 
 # This script is intended for the Linux Runpod container.
 if [[ "$(uname -s)" != "Linux" ]]; then
@@ -29,7 +29,7 @@ print("PyTorch:", torch.__version__)
 print("GPU:", torch.cuda.get_device_name(0))
 PY
 
-source scripts/runpod/env.sh
+source scripts/runpod/pod/env.sh
 
 # Install external tools used by OCR, audio, and image processing.
 apt-get update

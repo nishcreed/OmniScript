@@ -1,54 +1,159 @@
 # OmniScript
 
-See [hardware requirements and measured resource usage](docs/hardware-requirements.md)
-for the tested Runpod configuration and capacity-planning limits.
+OmniScript turns document images into readable text and multilingual audio. It
+combines document layout detection, OCR, picture captioning, image-text matching,
+translation, and speech synthesis.
 
-## Local API and UI checks without models
+## Research foundation
 
-Use the lightweight dependencies with the project's virtual environment:
+This project is based on my co-authored research paper,
+[**Multimodal book reader with multilingual support**](https://doi.org/10.1007/s11042-026-21145-5),
+published in *Multimedia Tools and Applications* (Springer, 2026).
+
+> Rajalakshmi S, Nishaanth R, Shrijith M R, and Angeldeborah S.
+> “Multimodal book reader with multilingual support.”
+> *Multimedia Tools and Applications*, 85, article 75 (2026).
+> DOI: [10.1007/s11042-026-21145-5](https://doi.org/10.1007/s11042-026-21145-5).
+
+The research explores accessible reading of textual and visual document content.
+This repository develops that work into a Python application, migrating the
+notebook implementation into modular inference code and deployable services.
+The current application and its supported languages may differ from the system
+and experiments described in the paper.
+
+## Project focus: multimodal ML deployment and MLOps
+
+The main goal is to gain practical experience deploying and operating a
+multimodal ML system. The work covers:
+
+- Moving notebook inference into reusable Python modules.
+- Serving GPU inference through a FastAPI backend.
+- Building a Gradio interface that communicates with the backend over HTTP.
+- Packaging frontend and backend services in separate Docker images.
+- Managing model downloads, persistent caches, startup, and health checks.
+- Testing mock and real inference paths, measuring hardware usage, and deploying
+  a backend that can scale to zero.
+
+## Deployment architecture
+
+```text
+Browser
+  → Render: Gradio frontend on CPU
+    → Runpod Serverless: FastAPI backend on GPU
+      → Layout detection, OCR, captioning, matching, translation, speech
+    ← Narration text and Base64-encoded WAV audio
+  ← Text display and audio playback
+```
+
+| Component | Hosting | Entry point | Dockerfile | Container port |
+| --- | --- | --- | --- | --- |
+| Frontend | Render | `frontend:app` | `Dockerfile.frontend` | 7860 |
+| Backend | Runpod Serverless Load Balancer | `src.api:api` | `Dockerfile` | 8000 |
+
+The Gradio server calls the backend's `/process` endpoint using
+`OMNISCRIPT_API_URL` and a server-side `RUNPOD_API_KEY`. The browser does not
+receive the API key. The backend returns narration and audio in one response.
+Uploaded images are processed temporarily, and Gradio uses temporary playback
+files rather than an application-level audio archive.
+
+Model files are cached on a Runpod Network Volume mounted at `/runpod-volume`.
+The backend prepares model files at startup and preloads models when
+`OMNISCRIPT_PRELOAD=1`. `/ping` and `/health` provide health-check routes.
+
+## Try the deployed frontend
+
+**[Open OmniScript](https://omniscript-frontend-v0-1-0.onrender.com/reader/)**
+
+1. Upload a PNG or JPEG document image, up to 20 MB.
+2. Select an output language.
+3. Optionally adjust pitch and speed for headings and descriptions.
+4. Click **Read document** to view the narration and play the audio.
+
+The current interface supports English, Tamil, Hindi, Telugu, Malayalam, and
+Kannada. The first request after inactivity can take longer while the frontend
+or GPU worker starts and models load.
+
+## Test locally
+
+Run commands from the repository root. The examples below use a POSIX shell
+such as Bash or Zsh.
+
+### 1. Install lightweight dependencies
+
+Use Python 3.12 to match the tested backend environment:
 
 ```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
 python -m pip install -r requirements-local.txt
-OMNISCRIPT_MOCK=1 python -m uvicorn src.api:api --host 127.0.0.1 --port 8000 --workers 1
 ```
 
-In a second terminal using the same virtual environment, start the frontend:
+These dependencies support the frontend and mock API without downloading the
+large inference models.
+
+### 2. Test both services locally with mock inference
+
+Start the mock backend in the first terminal:
 
 ```bash
-OMNISCRIPT_API_URL=http://127.0.0.1:8000 python -m uvicorn frontend:app --host 127.0.0.1 --port 7860
+OMNISCRIPT_MOCK=1 OMNISCRIPT_PRELOAD=0 \
+python -m uvicorn src.api:api --host 127.0.0.1 --port 8000 --workers 1
 ```
 
-Open http://localhost:7860/reader/, upload a PNG/JPEG, and select **Read document**.
-Mock mode returns sample text and a short tone. Pitch changes its frequency and
-speed changes its duration. It does not perform OCR, translation, or speech
-synthesis. The API returns the same text/Base64-WAV structure as real inference,
-and temporary input images are removed after processing.
-
-Gradio uses temporary playback files; its configured cache cleanup deletes older
-files periodically, and run history is disabled.
-
-Run the API smoke checks separately:
+In a second terminal, activate the same environment and start the frontend:
 
 ```bash
-OMNISCRIPT_MOCK=1 python -m unittest discover -s tests -v
+source .venv/bin/activate
+unset RUNPOD_API_KEY
+OMNISCRIPT_API_URL=http://127.0.0.1:8000 \
+python -m uvicorn frontend:app --host 127.0.0.1 --port 7860
 ```
 
-For real inference, install `requirements.txt`, provide the model assets and system
-dependencies, and restart the server with `OMNISCRIPT_MOCK=0`. Mock mode is read
-at startup; changing the setting requires a restart.
+Open **http://127.0.0.1:7860/reader/** and upload an image. Mock mode returns
+sample narration and a short tone; it checks the API/UI integration without
+performing OCR, translation, or real speech synthesis. The mock API documentation
+is available at **http://127.0.0.1:8000/docs**.
 
-## Frontend with a remote backend
-
-Install `requirements-local.txt`, then run the frontend independently:
+Run the automated checks in the activated environment:
 
 ```bash
-export OMNISCRIPT_API_URL="https://q3em8wv38golwg.api.runpod.ai"
-# Set RUNPOD_API_KEY in this terminal for the authenticated Runpod endpoint.
-python -m uvicorn frontend:app --host 127.0.0.1 --port 8000
+OMNISCRIPT_MOCK=1 OMNISCRIPT_PRELOAD=0 \
+python -m unittest discover -s tests -p "test_mock_api.py" -v
+OMNISCRIPT_MOCK=1 OMNISCRIPT_PRELOAD=0 \
+python -m unittest discover -s tests -p "test_ui.py" -v
 ```
 
-Open http://127.0.0.1:8000/reader/. This entry point imports only the UI and
-does not load the local inference backend, so `OMNISCRIPT_MOCK` and
-`OMNISCRIPT_PRELOAD` are unnecessary. The Gradio server sends requests to
-`OMNISCRIPT_API_URL` with the server-side `RUNPOD_API_KEY`.
-The backend entry point is `src.api:api`; the frontend entry point is `frontend:app`.
+### 3. Test a local frontend with real Runpod inference
+
+With the environment activated, set `OMNISCRIPT_API_URL` to the deployed
+endpoint URL and provide `RUNPOD_API_KEY` in the same terminal. Replace the
+placeholders below with your deployment settings:
+
+```bash
+export OMNISCRIPT_API_URL="https://<endpoint-id>.api.runpod.ai"
+export RUNPOD_API_KEY="<your-runpod-api-key>"
+python -m uvicorn frontend:app --host 127.0.0.1 --port 7860
+```
+
+Open **http://127.0.0.1:7860/reader/**. Inference runs on Runpod, so this mode
+does not require local model downloads or a local GPU. Stop any frontend already
+using port 7860 before starting another one.
+
+The application does not automatically load `.env`; configure environment
+variables in the launching process or hosting platform. Keep credentials out of
+source control and Docker images.
+
+### Running real inference on local hardware
+
+The mock setup above is not sufficient for local model inference. Real inference
+requires `requirements.txt`, model assets, and system tools including Tesseract,
+FFmpeg, and Rubber Band, plus enough RAM and GPU memory for the models.
+The backend `Dockerfile` and `scripts/runpod/` contain the environment
+preparation and model-check scripts.
+
+## Deployment notes
+
+See [deployment decisions and observations](docs/deployment-notes.md) for
+architecture rationale, troubleshooting findings, the earlier Pod testing
+workflow, and measured resource usage. Detailed measurements are recorded in
+[hardware requirements](docs/hardware-requirements.md).

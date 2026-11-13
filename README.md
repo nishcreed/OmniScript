@@ -73,6 +73,13 @@ The current interface supports English, Tamil, Hindi, Telugu, Malayalam, and
 Kannada. The first request after inactivity can take longer while the frontend
 or GPU worker starts and models load.
 
+## Sample output
+
+The example below shows the narration and audio playback interface after
+processing [the sample document](samples/Fig18.png) in English.
+
+![OmniScript showing English document narration and the generated audio waveform](output/sample_output.png)
+
 ## Test locally
 
 Run commands from the repository root. The examples below use a POSIX shell

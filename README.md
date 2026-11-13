@@ -47,7 +47,7 @@ Browser
 
 | Component | Hosting | Entry point | Dockerfile | Container port |
 | --- | --- | --- | --- | --- |
-| Frontend | Render | `frontend:app` | `Dockerfile.frontend` | 7860 |
+| Frontend | Render | `src.frontend:app` | `Dockerfile.frontend` | 7860 |
 | Backend | Runpod Serverless Load Balancer | `src.api:api` | `Dockerfile` | 8000 |
 
 The Gradio server calls the backend's `/process` endpoint using
@@ -113,7 +113,7 @@ In a second terminal, activate the same environment and start the frontend:
 source .venv/bin/activate
 unset RUNPOD_API_KEY
 OMNISCRIPT_API_URL=http://127.0.0.1:8000 \
-python -m uvicorn frontend:app --host 127.0.0.1 --port 7860
+python -m uvicorn src.frontend:app --host 127.0.0.1 --port 7860
 ```
 
 Open **http://127.0.0.1:7860/reader/** and upload an image. Mock mode returns
@@ -139,7 +139,7 @@ placeholders below with your deployment settings:
 ```bash
 export OMNISCRIPT_API_URL="https://<endpoint-id>.api.runpod.ai"
 export RUNPOD_API_KEY="<your-runpod-api-key>"
-python -m uvicorn frontend:app --host 127.0.0.1 --port 7860
+python -m uvicorn src.frontend:app --host 127.0.0.1 --port 7860
 ```
 
 Open **http://127.0.0.1:7860/reader/**. Inference runs on Runpod, so this mode
@@ -157,6 +157,29 @@ requires `requirements.txt`, model assets, and system tools including Tesseract,
 FFmpeg, and Rubber Band, plus enough RAM and GPU memory for the models.
 The backend `Dockerfile` and `scripts/runpod/` contain the environment
 preparation and model-check scripts.
+
+## Deploy the frontend image
+
+The frontend entry point is `src/frontend.py`. Its image copies only the package
+initializer, frontend application, and UI module; inference models are not loaded
+by this service.
+
+Build and push a new image tag, for example `v0.1.1`:
+
+```bash
+docker buildx build \
+  --platform linux/amd64 \
+  -f Dockerfile.frontend \
+  -t nishcreed/omniscript-frontend:v0.1.1 \
+  --push .
+```
+
+Update the existing Render service's image reference to
+`docker.io/nishcreed/omniscript-frontend:v0.1.1` and deploy it. Keep
+`OMNISCRIPT_API_URL` and `RUNPOD_API_KEY` configured in Render. If a custom Docker
+command was set on the service, clear it to use the image's command, or update it
+to `python -m uvicorn src.frontend:app --host 0.0.0.0 --port 7860`.
+The service continues to serve the UI at `/reader/`.
 
 ## Deployment notes
 

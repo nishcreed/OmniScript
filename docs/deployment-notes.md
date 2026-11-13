@@ -5,7 +5,7 @@ performed while migrating the notebook implementation to deployed services.
 Measurements describe the tested configurations and do not establish minimum
 hardware requirements or production capacity.
 
-The combined `main.py` entry point was removed in favor of `frontend:app`
+The combined `main.py` entry point was removed in favor of `src.frontend:app`
 and `src.api:api`.
 
 ## Decisions

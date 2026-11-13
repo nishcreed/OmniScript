@@ -14,3 +14,6 @@ notebooks/
 docs/
 tests/
 .DS_Store
+
+# Local reminder
+RUNPOD_REMINDER.private.md

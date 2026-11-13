@@ -6,3 +6,6 @@ huggingface-token.txt
 .env
 .env.*
 .DS_Store
+
+# Local reminder
+RUNPOD_REMINDER.private.md
